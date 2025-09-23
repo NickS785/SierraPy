@@ -15,7 +15,7 @@ A Python library for Sierra Chart data parsing and analysis, providing efficient
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/sierrapy.git
+git clone https://github.com/NickS785/sierrapy.git
 cd sierrapy
 pip install -e .
 ```
