@@ -1,0 +1,21 @@
+# Include base requirements
+-r requirements.txt
+
+# Development dependencies
+pytest>=6.0
+pytest-cov
+black>=22.0
+flake8>=4.0
+mypy>=0.910
+build>=0.8.0
+twine>=4.0.0
+
+# Optional dependencies for full functionality
+pyarrow>=5.0.0
+
+# Documentation
+sphinx>=4.0.0
+sphinx-rtd-theme
+
+# Pre-commit hooks
+pre-commit>=2.15.0
