@@ -132,13 +132,15 @@ async def load_continuous_series():
         "CL",
         start="2024-01-01",
         end="2024-12-31",
+        volume_per_bar=50_000,      # bucket trades into ~50k volume bars while loading
+        resample_rule="15T",        # optionally resample the stitched series to 15-minute bars
     )
 
     # Load multiple raw files concurrently
     raw = await reader.load_scid_files([
         "/path/to/CLU24-NYM.scid",
         "/path/to/CLZ24-NYM.scid",
-    ])
+    ], volume_per_bar=25_000)
 
     return df, raw
 
@@ -178,6 +180,7 @@ sierrapy-scid /path/to/file.scid --export output.csv --start 2024-09-10T00:00:00
 - **Vectorized operations**: NumPy-based processing for speed
 - **Chunked processing**: Handle files larger than available RAM
 - **Binary search**: Fast time-based filtering
+- **In-flight aggregation**: Bucket to volume bars or resample to new timeframes while reading
 
 ## Examples
 

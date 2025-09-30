@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 from .scid_parse import FastScidReader, RollPeriod, ScidTickerFileManager
 
@@ -94,11 +94,26 @@ class AsyncFrontMonthScidReader:
         columns: Optional[Sequence[str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
         include_metadata: bool = True,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+
     ) -> "pd.DataFrame":
         frame_pd = _ensure_pandas()
 
         start_ts = _coerce_timestamp(start)
         end_ts = _coerce_timestamp(end)
+
+        effective_columns: Optional[List[str]] = None
+        drop_volume_column = False
+        if columns is not None:
+            effective_columns = list(columns)
+
+        if volume_per_bar is not None and effective_columns is not None:
+            if volume_column not in effective_columns:
+                effective_columns.append(volume_column)
+                drop_volume_column = True
 
         periods = self._manager.generate_roll_schedule(
             ticker,
@@ -111,7 +126,17 @@ class AsyncFrontMonthScidReader:
             return frame_pd.DataFrame()
 
         tasks = [
-            self._read_period(period, columns=columns, include_metadata=include_metadata)
+            self._read_period(
+                period,
+                columns=effective_columns or columns,
+                include_metadata=include_metadata,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+                drop_volume_column=drop_volume_column,
+            )
+
             for period in periods
         ]
 
@@ -139,14 +164,38 @@ class AsyncFrontMonthScidReader:
         end_ms: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         include_path_column: bool = True,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, "pd.DataFrame"]:
         _ensure_pandas()
+
+        effective_columns: Optional[List[str]] = None
+        drop_volume_column = False
+        if columns is not None:
+            effective_columns = list(columns)
+
+        if volume_per_bar is not None and effective_columns is not None:
+            if volume_column not in effective_columns:
+                effective_columns.append(volume_column)
+                drop_volume_column = True
 
         normalized: List[Path] = [Path(path) for path in file_paths]
         results: Dict[str, "pd.DataFrame"] = {}
 
         async def _read_and_store(path: Path) -> None:
-            df = await self._read_file(path, start_ms=start_ms, end_ms=end_ms, columns=columns)
+            df = await self._read_file(
+                path,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                columns=effective_columns or columns,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+                drop_volume_column=drop_volume_column,
+            )
             if include_path_column and not df.empty:
                 df = df.copy()
                 df["SourceFile"] = str(path)
@@ -161,6 +210,12 @@ class AsyncFrontMonthScidReader:
         *,
         columns: Optional[Sequence[str]],
         include_metadata: bool,
+        volume_per_bar: Optional[int],
+        volume_column: str,
+        resample_rule: Optional[str],
+        resample_kwargs: Optional[Dict[str, Any]],
+        drop_volume_column: bool,
+
     ) -> "pd.DataFrame":
         start_bound = _ensure_utc(period.start)
         end_bound = _ensure_utc(period.end)
@@ -169,7 +224,16 @@ class AsyncFrontMonthScidReader:
 
         def _load() -> "pd.DataFrame":
             with FastScidReader(str(period.contract.file_path)).open() as reader:
-                df = reader.to_pandas(start_ms=start_ms, end_ms=end_ms, columns=columns)
+                df = reader.to_pandas(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    columns=columns,
+                    volume_per_bar=volume_per_bar,
+                    volume_column=volume_column,
+                    resample_rule=resample_rule,
+                    resample_kwargs=resample_kwargs,
+                )
+
             if include_metadata:
                 df = df.copy()
                 df["Contract"] = period.contract.contract_id
@@ -183,6 +247,9 @@ class AsyncFrontMonthScidReader:
         if df.empty:
             return df
 
+        if drop_volume_column and volume_column in df.columns:
+            df = df.drop(columns=[volume_column])
+
         mask = (df.index >= start_bound) & (df.index < end_bound)
         return df.loc[mask]
 
@@ -193,6 +260,12 @@ class AsyncFrontMonthScidReader:
         start_ms: Optional[int],
         end_ms: Optional[int],
         columns: Optional[Sequence[str]],
+        volume_per_bar: Optional[int],
+        volume_column: str,
+        resample_rule: Optional[str],
+        resample_kwargs: Optional[Dict[str, Any]],
+        drop_volume_column: bool,
+
     ) -> "pd.DataFrame":
         frame_pd = _ensure_pandas()
 
@@ -202,9 +275,21 @@ class AsyncFrontMonthScidReader:
                 return frame_pd.DataFrame()
 
             with FastScidReader(str(path)).open() as reader:
-                return reader.to_pandas(start_ms=start_ms, end_ms=end_ms, columns=columns)
+                return reader.to_pandas(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    columns=columns,
+                    volume_per_bar=volume_per_bar,
+                    volume_column=volume_column,
+                    resample_rule=resample_rule,
+                    resample_kwargs=resample_kwargs,
+                )
 
-        return await self._run_in_executor(_load)
+        df = await self._run_in_executor(_load)
+        if drop_volume_column and volume_column in df.columns:
+            df = df.drop(columns=[volume_column])
+        return df
+                
 
     async def _run_in_executor(self, func: Callable[[], T]) -> T:
         if self._semaphore is None:

@@ -31,7 +31,7 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -129,6 +129,115 @@ def _validate_days(x: float) -> bool:
     # Accept roughly 1930..2100 to be generous
     # 1930-01-01 in SC days ~ 10957, 2100-01-01 ~ 73050
     return 9000.0 <= x <= 80000.0
+
+
+def _default_ohlcv_aggregation(columns: Sequence[str]) -> Dict[str, str]:
+    agg: Dict[str, str] = {}
+    if "Open" in columns:
+        agg["Open"] = "first"
+    if "High" in columns:
+        agg["High"] = "max"
+    if "Low" in columns:
+        agg["Low"] = "min"
+    if "Close" in columns:
+        agg["Close"] = "last"
+
+    sum_candidates = {"NumTrades", "TotalVolume", "BidVolume", "AskVolume"}
+    for name in columns:
+        if name in sum_candidates:
+            agg[name] = "sum"
+
+    for name in columns:
+        if name not in agg:
+            agg[name] = "last"
+
+    return agg
+
+
+def _resample_ohlcv(
+    frame: "pd.DataFrame",
+    rule: str,
+    *,
+    resample_kwargs: Optional[Mapping[str, Any]] = None,
+) -> "pd.DataFrame":
+    if frame.empty:
+        return frame
+
+    kwargs = dict(resample_kwargs or {})
+    agg = kwargs.pop("agg", None)
+
+    resampled = frame.resample(rule, **kwargs)
+    if agg is None:
+        agg = _default_ohlcv_aggregation(frame.columns)
+
+    result = resampled.agg(agg)
+    result.index.name = frame.index.name
+    return result.dropna(how="all")
+
+
+def _bucket_by_volume(
+    index: "pd.DatetimeIndex",
+    data: Dict[str, np.ndarray],
+    *,
+    volume_per_bar: int,
+    volume_column: str,
+) -> Tuple["pd.DatetimeIndex", Dict[str, np.ndarray]]:
+    if index.empty:
+        return index, {name: arr[:0] for name, arr in data.items()}
+
+    ordered_columns = list(data.keys())
+    volume = np.asarray(data[volume_column], dtype=np.int64)
+    cumsum = np.cumsum(volume, dtype=np.int64)
+    bucket_ids = np.floor_divide(np.maximum(cumsum - 1, 0), volume_per_bar)
+
+    change = np.empty_like(bucket_ids, dtype=bool)
+    change[0] = True
+    if change.size > 1:
+        change[1:] = bucket_ids[1:] != bucket_ids[:-1]
+    starts = np.flatnonzero(change)
+    ends = np.empty_like(starts)
+    ends[:-1] = starts[1:]
+    ends[-1] = bucket_ids.size
+    last_idx = ends - 1
+
+    idx_values = index.asi8
+    new_index = pd.DatetimeIndex(idx_values[last_idx], tz=index.tz)
+    new_index.name = index.name
+
+    result: Dict[str, np.ndarray] = {}
+    handled: set[str] = set()
+
+    def _assign(name: str, values: np.ndarray) -> None:
+        result[name] = values
+        handled.add(name)
+
+    def _sum_reduce(arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return arr
+        if arr.dtype.kind in "iu":
+            return np.add.reduceat(arr.astype(np.int64, copy=False), starts)
+        return np.add.reduceat(arr, starts)
+
+    if "Open" in data:
+        _assign("Open", np.asarray(data["Open"])[starts])
+    if "High" in data:
+        _assign("High", np.maximum.reduceat(np.asarray(data["High"]), starts))
+    if "Low" in data:
+        _assign("Low", np.minimum.reduceat(np.asarray(data["Low"]), starts))
+    if "Close" in data:
+        _assign("Close", np.asarray(data["Close"])[last_idx])
+
+    sum_columns = {"NumTrades", "TotalVolume", "BidVolume", "AskVolume", volume_column}
+    for name in sum_columns:
+        if name in data and name not in handled:
+            _assign(name, _sum_reduce(np.asarray(data[name])))
+
+    for name in ordered_columns:
+        if name not in handled:
+            arr = np.asarray(data[name])
+            _assign(name, arr[last_idx])
+
+    return new_index, result
 
 
 class FastScidReader:
@@ -408,6 +517,10 @@ class FastScidReader:
         end_ms: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         tz: Optional[str] = None,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Mapping[str, Any]] = None,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
     ):
         if pd is None:
             raise RuntimeError("pandas is not installed; run `pip install pandas`")
@@ -419,13 +532,47 @@ class FastScidReader:
             idx = idx.tz_convert(tz)
 
         # Force copies to avoid holding references to memory-mapped buffer
-        data_dict = {}
-        for name in (columns or ["Open", "High", "Low", "Close", "NumTrades", "TotalVolume", "BidVolume", "AskVolume"]):
+        data_dict: Dict[str, np.ndarray] = {}
+        for name in (
+            columns
+            or [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "NumTrades",
+                "TotalVolume",
+                "BidVolume",
+                "AskVolume",
+            ]
+        ):
             if name in v.dtype.names:
                 data_dict[name] = v[name].copy()  # Force copy
 
+        if volume_per_bar is not None:
+            if volume_per_bar <= 0:
+                raise ValueError("volume_per_bar must be a positive integer")
+            if volume_column not in data_dict:
+                raise ValueError(
+                    f"Column '{volume_column}' is required for volume bucketing"
+                )
+            idx, data_dict = _bucket_by_volume(
+                idx,
+                data_dict,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+            )
+
         frame = pd.DataFrame(data_dict, index=idx)
         frame.index.name = "DateTime"
+
+        if resample_rule:
+            frame = _resample_ohlcv(
+                frame,
+                resample_rule,
+                resample_kwargs=resample_kwargs,
+            )
+
         return frame
 
     # ------------------------------ iteration utils -----------------------------
