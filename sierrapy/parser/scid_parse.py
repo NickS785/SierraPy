@@ -54,6 +54,9 @@ _SECONDS_PER_DAY = 86400.0
 _MAX_REASONABLE_UNIX = 4102444800  # 2100-01-01
 _MIN_REASONABLE_UNIX = 315532800   # 1980-01-01
 
+# Sierra Chart uses this sentinel value for invalid/empty OHLC data
+_SCID_INVALID_FLOAT = -1.9990019654456028e+37  # SC's "empty" marker for float32
+
 # NumPy structured dtypes (little-endian) - Compatible with Sierra Chart SCID format
 DTYPE_V10_40B = np.dtype([
     ("DateTime", "<i8"),      # int64 microseconds since 1899-12-30 (modern format)
@@ -129,6 +132,21 @@ def _validate_days(x: float) -> bool:
     # Accept roughly 1930..2100 to be generous
     # 1930-01-01 in SC days ~ 10957, 2100-01-01 ~ 73050
     return 9000.0 <= x <= 80000.0
+
+
+def _clean_invalid_floats(arr: np.ndarray) -> np.ndarray:
+    """Replace Sierra Chart's invalid float sentinel values with NaN.
+
+    Sierra Chart uses approximately -1.999e37 to mark invalid/empty OHLC values.
+    This function replaces those sentinel values with proper NaN.
+    """
+    # Use a threshold since float32 precision makes exact comparison unreliable
+    # Any value less than -1e37 is considered invalid
+    cleaned = arr.copy()
+    invalid_mask = cleaned < -1e37
+    if invalid_mask.any():
+        cleaned[invalid_mask] = np.nan
+    return cleaned
 
 
 def _default_ohlcv_aggregation(columns: Sequence[str]) -> Dict[str, str]:
@@ -521,6 +539,7 @@ class FastScidReader:
         resample_kwargs: Optional[Mapping[str, Any]] = None,
         volume_per_bar: Optional[int] = None,
         volume_column: str = "TotalVolume",
+        drop_invalid_rows: bool = False,
     ):
         if pd is None:
             raise RuntimeError("pandas is not installed; run `pip install pandas`")
@@ -533,6 +552,7 @@ class FastScidReader:
 
         # Force copies to avoid holding references to memory-mapped buffer
         data_dict: Dict[str, np.ndarray] = {}
+        ohlc_columns = {"Open", "High", "Low", "Close"}
         for name in (
             columns
             or [
@@ -547,7 +567,11 @@ class FastScidReader:
             ]
         ):
             if name in v.dtype.names:
-                data_dict[name] = v[name].copy()  # Force copy
+                arr = v[name].copy()  # Force copy
+                # Clean invalid sentinel values in OHLC columns
+                if name in ohlc_columns:
+                    arr = _clean_invalid_floats(arr)
+                data_dict[name] = arr
 
         if volume_per_bar is not None:
             if volume_per_bar <= 0:
@@ -565,6 +589,14 @@ class FastScidReader:
 
         frame = pd.DataFrame(data_dict, index=idx)
         frame.index.name = "DateTime"
+
+        # Optionally drop rows with invalid OHLC data
+        if drop_invalid_rows:
+            price_cols = [c for c in ["Open", "High", "Low", "Close"] if c in frame.columns]
+            if price_cols:
+                # Drop rows where any price column is NaN or <= 0
+                valid_mask = frame[price_cols].notna().all(axis=1) & (frame[price_cols] > 0).all(axis=1)
+                frame = frame[valid_mask]
 
         if resample_rule:
             frame = _resample_ohlcv(

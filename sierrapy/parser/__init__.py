@@ -18,7 +18,16 @@ from .dly_parse import (
     parse_contract_filename,
 )
 from .async_scid_reader import AsyncFrontMonthScidReader
-
+resample_logic = {
+                "Open":"first",
+                "High":"max",
+                "Low":"min",
+                "Close":"last",
+                "Volume":"sum",
+                "NumberOfTrades":"sum",
+                "BidVolume":"sum",
+                "AskVolume":"sum"
+                }
 __all__ = [
     # SCID parsing
     "FastScidReader",
@@ -33,4 +42,7 @@ __all__ = [
     "ContractInfo",
     "calculate_contract_expiry",
     "parse_contract_filename",
+
+    #Utilities
+    "resample_logic"
 ]

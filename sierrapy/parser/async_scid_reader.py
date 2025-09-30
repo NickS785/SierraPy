@@ -98,6 +98,7 @@ class AsyncFrontMonthScidReader:
         volume_column: str = "TotalVolume",
         resample_rule: Optional[str] = None,
         resample_kwargs: Optional[Dict[str, Any]] = None,
+        drop_invalid_rows: bool = False,
 
     ) -> "pd.DataFrame":
         frame_pd = _ensure_pandas()
@@ -135,6 +136,7 @@ class AsyncFrontMonthScidReader:
                 resample_rule=resample_rule,
                 resample_kwargs=resample_kwargs,
                 drop_volume_column=drop_volume_column,
+                drop_invalid_rows=drop_invalid_rows,
             )
 
             for period in periods
@@ -215,6 +217,7 @@ class AsyncFrontMonthScidReader:
         resample_rule: Optional[str],
         resample_kwargs: Optional[Dict[str, Any]],
         drop_volume_column: bool,
+        drop_invalid_rows: bool,
 
     ) -> "pd.DataFrame":
         start_bound = _ensure_utc(period.start)
@@ -232,6 +235,7 @@ class AsyncFrontMonthScidReader:
                     volume_column=volume_column,
                     resample_rule=resample_rule,
                     resample_kwargs=resample_kwargs,
+                    drop_invalid_rows=drop_invalid_rows,
                 )
 
             if include_metadata:
