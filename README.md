@@ -114,6 +114,40 @@ This logic works well for:
 - **Financial contracts** (ES, NQ, etc.): Expire in delivery month
 - **Other contracts**: Default to delivery month expiry
 
+### Asynchronous Front-Month Reader
+
+For workflows that require stitching contracts over long horizons, the
+`AsyncFrontMonthScidReader` orchestrates roll schedules (rolling one month before
+expiry) and loads multiple `.scid` files concurrently:
+
+```python
+import asyncio
+import sierrapy
+
+async def load_continuous_series():
+    reader = sierrapy.AsyncFrontMonthScidReader("/path/to/scid/folder")
+
+    # Build a roll schedule (one month before expiry) and load front-month data
+    df = await reader.load_front_month_series(
+        "CL",
+        start="2024-01-01",
+        end="2024-12-31",
+        volume_per_bar=50_000,      # bucket trades into ~50k volume bars while loading
+        resample_rule="15T",        # optionally resample the stitched series to 15-minute bars
+    )
+
+    # Load multiple raw files concurrently
+    raw = await reader.load_scid_files([
+        "/path/to/CLU24-NYM.scid",
+        "/path/to/CLZ24-NYM.scid",
+    ], volume_per_bar=25_000)
+
+    return df, raw
+
+continuous_df, raw_files = asyncio.run(load_continuous_series())
+print(continuous_df.head())
+```
+
 ## File Format Support
 
 ### SCID Files
@@ -146,6 +180,7 @@ sierrapy-scid /path/to/file.scid --export output.csv --start 2024-09-10T00:00:00
 - **Vectorized operations**: NumPy-based processing for speed
 - **Chunked processing**: Handle files larger than available RAM
 - **Binary search**: Fast time-based filtering
+- **In-flight aggregation**: Bucket to volume bars or resample to new timeframes while reading
 
 ## Examples
 

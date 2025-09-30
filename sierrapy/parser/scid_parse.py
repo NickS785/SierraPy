@@ -31,7 +31,7 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -129,6 +129,115 @@ def _validate_days(x: float) -> bool:
     # Accept roughly 1930..2100 to be generous
     # 1930-01-01 in SC days ~ 10957, 2100-01-01 ~ 73050
     return 9000.0 <= x <= 80000.0
+
+
+def _default_ohlcv_aggregation(columns: Sequence[str]) -> Dict[str, str]:
+    agg: Dict[str, str] = {}
+    if "Open" in columns:
+        agg["Open"] = "first"
+    if "High" in columns:
+        agg["High"] = "max"
+    if "Low" in columns:
+        agg["Low"] = "min"
+    if "Close" in columns:
+        agg["Close"] = "last"
+
+    sum_candidates = {"NumTrades", "TotalVolume", "BidVolume", "AskVolume"}
+    for name in columns:
+        if name in sum_candidates:
+            agg[name] = "sum"
+
+    for name in columns:
+        if name not in agg:
+            agg[name] = "last"
+
+    return agg
+
+
+def _resample_ohlcv(
+    frame: "pd.DataFrame",
+    rule: str,
+    *,
+    resample_kwargs: Optional[Mapping[str, Any]] = None,
+) -> "pd.DataFrame":
+    if frame.empty:
+        return frame
+
+    kwargs = dict(resample_kwargs or {})
+    agg = kwargs.pop("agg", None)
+
+    resampled = frame.resample(rule, **kwargs)
+    if agg is None:
+        agg = _default_ohlcv_aggregation(frame.columns)
+
+    result = resampled.agg(agg)
+    result.index.name = frame.index.name
+    return result.dropna(how="all")
+
+
+def _bucket_by_volume(
+    index: "pd.DatetimeIndex",
+    data: Dict[str, np.ndarray],
+    *,
+    volume_per_bar: int,
+    volume_column: str,
+) -> Tuple["pd.DatetimeIndex", Dict[str, np.ndarray]]:
+    if index.empty:
+        return index, {name: arr[:0] for name, arr in data.items()}
+
+    ordered_columns = list(data.keys())
+    volume = np.asarray(data[volume_column], dtype=np.int64)
+    cumsum = np.cumsum(volume, dtype=np.int64)
+    bucket_ids = np.floor_divide(np.maximum(cumsum - 1, 0), volume_per_bar)
+
+    change = np.empty_like(bucket_ids, dtype=bool)
+    change[0] = True
+    if change.size > 1:
+        change[1:] = bucket_ids[1:] != bucket_ids[:-1]
+    starts = np.flatnonzero(change)
+    ends = np.empty_like(starts)
+    ends[:-1] = starts[1:]
+    ends[-1] = bucket_ids.size
+    last_idx = ends - 1
+
+    idx_values = index.asi8
+    new_index = pd.DatetimeIndex(idx_values[last_idx], tz=index.tz)
+    new_index.name = index.name
+
+    result: Dict[str, np.ndarray] = {}
+    handled: set[str] = set()
+
+    def _assign(name: str, values: np.ndarray) -> None:
+        result[name] = values
+        handled.add(name)
+
+    def _sum_reduce(arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return arr
+        if arr.dtype.kind in "iu":
+            return np.add.reduceat(arr.astype(np.int64, copy=False), starts)
+        return np.add.reduceat(arr, starts)
+
+    if "Open" in data:
+        _assign("Open", np.asarray(data["Open"])[starts])
+    if "High" in data:
+        _assign("High", np.maximum.reduceat(np.asarray(data["High"]), starts))
+    if "Low" in data:
+        _assign("Low", np.minimum.reduceat(np.asarray(data["Low"]), starts))
+    if "Close" in data:
+        _assign("Close", np.asarray(data["Close"])[last_idx])
+
+    sum_columns = {"NumTrades", "TotalVolume", "BidVolume", "AskVolume", volume_column}
+    for name in sum_columns:
+        if name in data and name not in handled:
+            _assign(name, _sum_reduce(np.asarray(data[name])))
+
+    for name in ordered_columns:
+        if name not in handled:
+            arr = np.asarray(data[name])
+            _assign(name, arr[last_idx])
+
+    return new_index, result
 
 
 class FastScidReader:
@@ -408,6 +517,10 @@ class FastScidReader:
         end_ms: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         tz: Optional[str] = None,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Mapping[str, Any]] = None,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
     ):
         if pd is None:
             raise RuntimeError("pandas is not installed; run `pip install pandas`")
@@ -419,13 +532,47 @@ class FastScidReader:
             idx = idx.tz_convert(tz)
 
         # Force copies to avoid holding references to memory-mapped buffer
-        data_dict = {}
-        for name in (columns or ["Open", "High", "Low", "Close", "NumTrades", "TotalVolume", "BidVolume", "AskVolume"]):
+        data_dict: Dict[str, np.ndarray] = {}
+        for name in (
+            columns
+            or [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "NumTrades",
+                "TotalVolume",
+                "BidVolume",
+                "AskVolume",
+            ]
+        ):
             if name in v.dtype.names:
                 data_dict[name] = v[name].copy()  # Force copy
 
+        if volume_per_bar is not None:
+            if volume_per_bar <= 0:
+                raise ValueError("volume_per_bar must be a positive integer")
+            if volume_column not in data_dict:
+                raise ValueError(
+                    f"Column '{volume_column}' is required for volume bucketing"
+                )
+            idx, data_dict = _bucket_by_volume(
+                idx,
+                data_dict,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+            )
+
         frame = pd.DataFrame(data_dict, index=idx)
         frame.index.name = "DateTime"
+
+        if resample_rule:
+            frame = _resample_ohlcv(
+                frame,
+                resample_rule,
+                resample_kwargs=resample_kwargs,
+            )
+
         return frame
 
     # ------------------------------ iteration utils -----------------------------
@@ -770,6 +917,7 @@ class FastScidReader:
 @dataclass(frozen=True)
 class ScidContractInfo:
     """Contract information parsed from SCID filename."""
+
     ticker: str
     month: str
     year: int
@@ -779,6 +927,21 @@ class ScidContractInfo:
     @property
     def contract_id(self) -> str:
         return f"{self.month}{str(self.year)[-2:]}"
+
+
+@dataclass(frozen=True)
+class RollPeriod:
+    """Represents the active window for a specific futures contract."""
+
+    contract: ScidContractInfo
+    start: "pd.Timestamp"
+    end: "pd.Timestamp"
+    roll_date: "pd.Timestamp"
+    expiry: "pd.Timestamp"
+
+    @property
+    def contract_id(self) -> str:
+        return self.contract.contract_id
 
 
 class ScidTickerFileManager:
@@ -865,6 +1028,96 @@ class ScidTickerFileManager:
             expiry_month = month_num
 
         return pd.Timestamp(year=expiry_year, month=expiry_month, day=20)
+
+    def calculate_contract_expiry(self, contract: ScidContractInfo) -> pd.Timestamp:
+        """Public helper for retrieving the calculated expiry of a contract."""
+
+        return self._calculate_contract_expiry(contract)
+
+    def generate_roll_schedule(
+        self,
+        ticker: str,
+        *,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
+        roll_offset: Optional[pd.DateOffset] = None,
+    ) -> List[RollPeriod]:
+        """
+        Build a roll schedule for ``ticker`` using "roll one month before expiry" logic.
+
+        Parameters
+        ----------
+        ticker:
+            Futures symbol to build the schedule for.
+        start, end:
+            Optional start/end boundaries for the schedule. When omitted, the
+            schedule defaults to one roll offset before the first contract and
+            the final contract's expiry respectively.
+        roll_offset:
+            Offset applied backwards from the expiry to determine the roll date.
+            Defaults to one calendar month.
+
+        Returns
+        -------
+        list[RollPeriod]
+            Chronologically ordered list of contract windows.
+        """
+
+        if pd is None:
+            raise RuntimeError("pandas is required to generate a roll schedule")
+
+        contracts = self.get_contracts_for_ticker(ticker)
+        if not contracts:
+            return []
+
+        resolved_offset = roll_offset or pd.DateOffset(months=1)
+
+        entries: List[Tuple[ScidContractInfo, pd.Timestamp, pd.Timestamp]] = []
+        for contract in contracts:
+            expiry = self._calculate_contract_expiry(contract)
+            roll_date = expiry - resolved_offset
+            entries.append((contract, roll_date, expiry))
+
+        entries.sort(key=lambda item: item[1])
+
+        if start is None:
+            start = entries[0][1] - resolved_offset
+        if end is None:
+            end = entries[-1][2]
+
+        periods: List[RollPeriod] = []
+        for idx, (contract, roll_date, expiry) in enumerate(entries):
+            previous_roll = entries[idx - 1][1] if idx > 0 else entries[0][1] - resolved_offset
+            window_start = max(start, previous_roll)
+            if window_start >= end:
+                break
+
+            if window_start >= roll_date:
+                continue
+
+            if idx + 1 < len(entries):
+                next_roll_boundary = entries[idx + 1][1]
+            else:
+                next_roll_boundary = end
+
+            window_end = min(end, next_roll_boundary)
+            if idx == len(entries) - 1:
+                window_end = min(window_end, expiry)
+
+            if window_start >= window_end:
+                continue
+
+            periods.append(
+                RollPeriod(
+                    contract=contract,
+                    start=window_start,
+                    end=window_end,
+                    roll_date=roll_date,
+                    expiry=expiry,
+                )
+            )
+
+        return periods
 
     def get_tickers(self) -> List[str]:
         """Return list of all available tickers."""
