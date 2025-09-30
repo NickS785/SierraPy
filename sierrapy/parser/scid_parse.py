@@ -770,6 +770,7 @@ class FastScidReader:
 @dataclass(frozen=True)
 class ScidContractInfo:
     """Contract information parsed from SCID filename."""
+
     ticker: str
     month: str
     year: int
@@ -779,6 +780,21 @@ class ScidContractInfo:
     @property
     def contract_id(self) -> str:
         return f"{self.month}{str(self.year)[-2:]}"
+
+
+@dataclass(frozen=True)
+class RollPeriod:
+    """Represents the active window for a specific futures contract."""
+
+    contract: ScidContractInfo
+    start: "pd.Timestamp"
+    end: "pd.Timestamp"
+    roll_date: "pd.Timestamp"
+    expiry: "pd.Timestamp"
+
+    @property
+    def contract_id(self) -> str:
+        return self.contract.contract_id
 
 
 class ScidTickerFileManager:
@@ -865,6 +881,96 @@ class ScidTickerFileManager:
             expiry_month = month_num
 
         return pd.Timestamp(year=expiry_year, month=expiry_month, day=20)
+
+    def calculate_contract_expiry(self, contract: ScidContractInfo) -> pd.Timestamp:
+        """Public helper for retrieving the calculated expiry of a contract."""
+
+        return self._calculate_contract_expiry(contract)
+
+    def generate_roll_schedule(
+        self,
+        ticker: str,
+        *,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
+        roll_offset: Optional[pd.DateOffset] = None,
+    ) -> List[RollPeriod]:
+        """
+        Build a roll schedule for ``ticker`` using "roll one month before expiry" logic.
+
+        Parameters
+        ----------
+        ticker:
+            Futures symbol to build the schedule for.
+        start, end:
+            Optional start/end boundaries for the schedule. When omitted, the
+            schedule defaults to one roll offset before the first contract and
+            the final contract's expiry respectively.
+        roll_offset:
+            Offset applied backwards from the expiry to determine the roll date.
+            Defaults to one calendar month.
+
+        Returns
+        -------
+        list[RollPeriod]
+            Chronologically ordered list of contract windows.
+        """
+
+        if pd is None:
+            raise RuntimeError("pandas is required to generate a roll schedule")
+
+        contracts = self.get_contracts_for_ticker(ticker)
+        if not contracts:
+            return []
+
+        resolved_offset = roll_offset or pd.DateOffset(months=1)
+
+        entries: List[Tuple[ScidContractInfo, pd.Timestamp, pd.Timestamp]] = []
+        for contract in contracts:
+            expiry = self._calculate_contract_expiry(contract)
+            roll_date = expiry - resolved_offset
+            entries.append((contract, roll_date, expiry))
+
+        entries.sort(key=lambda item: item[1])
+
+        if start is None:
+            start = entries[0][1] - resolved_offset
+        if end is None:
+            end = entries[-1][2]
+
+        periods: List[RollPeriod] = []
+        for idx, (contract, roll_date, expiry) in enumerate(entries):
+            previous_roll = entries[idx - 1][1] if idx > 0 else entries[0][1] - resolved_offset
+            window_start = max(start, previous_roll)
+            if window_start >= end:
+                break
+
+            if window_start >= roll_date:
+                continue
+
+            if idx + 1 < len(entries):
+                next_roll_boundary = entries[idx + 1][1]
+            else:
+                next_roll_boundary = end
+
+            window_end = min(end, next_roll_boundary)
+            if idx == len(entries) - 1:
+                window_end = min(window_end, expiry)
+
+            if window_start >= window_end:
+                continue
+
+            periods.append(
+                RollPeriod(
+                    contract=contract,
+                    start=window_start,
+                    end=window_end,
+                    roll_date=roll_date,
+                    expiry=expiry,
+                )
+            )
+
+        return periods
 
     def get_tickers(self) -> List[str]:
         """Return list of all available tickers."""
