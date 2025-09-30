@@ -98,6 +98,7 @@ class AsyncFrontMonthScidReader:
         volume_column: str = "TotalVolume",
         resample_rule: Optional[str] = None,
         resample_kwargs: Optional[Dict[str, Any]] = None,
+
     ) -> "pd.DataFrame":
         frame_pd = _ensure_pandas()
 
@@ -135,6 +136,7 @@ class AsyncFrontMonthScidReader:
                 resample_kwargs=resample_kwargs,
                 drop_volume_column=drop_volume_column,
             )
+
             for period in periods
         ]
 
@@ -213,6 +215,7 @@ class AsyncFrontMonthScidReader:
         resample_rule: Optional[str],
         resample_kwargs: Optional[Dict[str, Any]],
         drop_volume_column: bool,
+
     ) -> "pd.DataFrame":
         start_bound = _ensure_utc(period.start)
         end_bound = _ensure_utc(period.end)
@@ -230,6 +233,7 @@ class AsyncFrontMonthScidReader:
                     resample_rule=resample_rule,
                     resample_kwargs=resample_kwargs,
                 )
+
             if include_metadata:
                 df = df.copy()
                 df["Contract"] = period.contract.contract_id
@@ -261,6 +265,7 @@ class AsyncFrontMonthScidReader:
         resample_rule: Optional[str],
         resample_kwargs: Optional[Dict[str, Any]],
         drop_volume_column: bool,
+
     ) -> "pd.DataFrame":
         frame_pd = _ensure_pandas()
 
@@ -284,6 +289,7 @@ class AsyncFrontMonthScidReader:
         if drop_volume_column and volume_column in df.columns:
             df = df.drop(columns=[volume_column])
         return df
+                
 
     async def _run_in_executor(self, func: Callable[[], T]) -> T:
         if self._semaphore is None:
