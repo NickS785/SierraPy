@@ -220,10 +220,28 @@ class AsyncFrontMonthScidReader:
         drop_invalid_rows: bool,
 
     ) -> "pd.DataFrame":
+        frame_pd = _ensure_pandas()
+
         start_bound = _ensure_utc(period.start)
         end_bound = _ensure_utc(period.end)
         start_ms = _timestamp_to_epoch_ms(period.start)
-        end_ms = _timestamp_to_epoch_ms(period.end)
+        end_exclusive_ms = _timestamp_to_epoch_ms(period.end)
+
+        if start_ms is not None and end_exclusive_ms is not None and start_ms >= end_exclusive_ms:
+            return frame_pd.DataFrame()
+
+        end_ms: Optional[int]
+        if end_exclusive_ms is None:
+            end_ms = None
+        else:
+            # ``FastScidReader.to_pandas`` treats ``end_ms`` as inclusive.
+            # Subtract one millisecond so the read window is effectively
+            # ``[start, end)`` which prevents pulling data from the next
+            # contract's roll window.
+            end_ms = end_exclusive_ms - 1
+
+            if start_ms is not None and end_ms < start_ms:
+                return frame_pd.DataFrame()
 
         def _load() -> "pd.DataFrame":
             with FastScidReader(str(period.contract.file_path)).open() as reader:
