@@ -107,6 +107,10 @@ pythonpath = [
     "."
 ]
 
+markers = [
+    "asyncio: mark async tests that require an event loop",
+]
+
 
 [tool.coverage.run]
 source = ["sierrapy"]
