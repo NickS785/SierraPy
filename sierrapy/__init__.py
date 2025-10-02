@@ -22,7 +22,7 @@ from .parser.scid_parse import (
     ScidContractInfo,
     Schema,
 )
-from .parser.async_scid_reader import AsyncFrontMonthScidReader
+from .parser.async_scid_reader import AsyncScidReader
 from .parser.dly_parse import (
     TickerFileManager,
     ContractInfo,
@@ -48,7 +48,7 @@ __all__ = [
 
     # SCID parsing
     "FastScidReader",
-    "AsyncFrontMonthScidReader",
+    "AsyncScidReader",
     "ScidTickerFileManager",
     "ScidContractInfo",
     "RollPeriod",

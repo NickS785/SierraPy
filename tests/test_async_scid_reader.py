@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from sierrapy.parser import async_scid_reader as asc
-from sierrapy.parser.async_scid_reader import AsyncFrontMonthScidReader
+from sierrapy.parser.async_scid_reader import AsyncScidReader
 from sierrapy.parser.scid_parse import RollPeriod, ScidContractInfo
 
 
@@ -59,7 +59,7 @@ class _DummyFastReader:
 def test_read_period_limits_contract_window(monkeypatch):
     _created_readers.clear()
 
-    reader = AsyncFrontMonthScidReader("/tmp")
+    reader = AsyncScidReader("/tmp")
 
     monkeypatch.setattr(asc, "FastScidReader", _DummyFastReader)
 

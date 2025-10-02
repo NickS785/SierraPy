@@ -12,8 +12,10 @@ from .scid_parse import FastScidReader, RollPeriod, ScidTickerFileManager
 
 try:  # Optional dependency (aligned with FastScidReader)
     import pandas as pd
+    import numpy as np
 except Exception:  # pragma: no cover - handled at runtime for optional dependency
     pd = None  # type: ignore[assignment]
+    np = None  # type: ignore[assignment]
 
 T = TypeVar("T")
 
@@ -47,7 +49,7 @@ def _timestamp_to_epoch_ms(ts: Optional["pd.Timestamp"]) -> Optional[int]:
     return int(utc_ts.value // 1_000_000)
 
 
-class AsyncFrontMonthScidReader:
+class AsyncScidReader:
     """Asynchronously load front-month SCID data across contract rolls."""
 
     def __init__(
@@ -148,6 +150,8 @@ class AsyncFrontMonthScidReader:
 
         combined = frame_pd.concat(frames, axis=0)
         combined.sort_index(inplace=True)
+
+        # Remove any duplicate timestamps (shouldn't occur with strict roll cutoff, but safety check)
         combined = combined.loc[~combined.index.duplicated(keep="last")]
 
         if start_ts is not None:
@@ -256,24 +260,33 @@ class AsyncFrontMonthScidReader:
                     drop_invalid_rows=drop_invalid_rows,
                 )
 
-            if include_metadata:
+            # STRICT enforcement: Delete any data at or past the roll date
+            # This prevents contract overlap during roll periods
+            if not df.empty:
+                roll_cutoff = _ensure_utc(period.roll_date)
+                # Keep only data before the roll date (exclusive)
+                df = df[df.index < roll_cutoff]
+
+            # Apply period bounds
+            if not df.empty:
+                mask = (df.index >= start_bound) & (df.index < end_bound)
+                df = df.loc[mask]
+
+            if include_metadata and not df.empty:
                 df = df.copy()
                 df["Contract"] = period.contract.contract_id
                 df["Ticker"] = period.contract.ticker
                 df["RollDate"] = _ensure_utc(period.roll_date)
                 df["ContractExpiry"] = _ensure_utc(period.expiry)
                 df["SourceFile"] = str(period.contract.file_path)
+
+            if drop_volume_column and volume_column in df.columns:
+                df = df.drop(columns=[volume_column])
+
             return df
 
         df = await self._run_in_executor(_load)
-        if df.empty:
-            return df
-
-        if drop_volume_column and volume_column in df.columns:
-            df = df.drop(columns=[volume_column])
-
-        mask = (df.index >= start_bound) & (df.index < end_bound)
-        return df.loc[mask]
+        return df
 
     async def _read_file(
         self,
@@ -329,7 +342,103 @@ class AsyncFrontMonthScidReader:
             return await to_thread(func)
 
 
+class ScidReader:
+    """Synchronous wrapper around AsyncScidReader that handles asyncio automatically."""
+
+    def __init__(
+        self,
+        directory: Union[str, Path],
+        *,
+        max_concurrency: Optional[int] = None,
+    ) -> None:
+        self._async_reader = AsyncScidReader(
+            directory,
+            max_concurrency=max_concurrency,
+        )
+
+
+    @property
+    def manager(self) -> ScidTickerFileManager:
+        return self._async_reader.manager
+
+    def generate_roll_schedule(
+        self,
+        ticker: str,
+        *,
+        start: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        end: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        roll_offset: Optional["pd.DateOffset"] = None,
+    ) -> List[RollPeriod]:
+        return self._async_reader.generate_roll_schedule(
+            ticker,
+            start=start,
+            end=end,
+            roll_offset=roll_offset,
+        )
+
+    def load_front_month_series(
+        self,
+        ticker: str,
+        *,
+        start: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        end: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        columns: Optional[Sequence[str]] = None,
+        roll_offset: Optional["pd.DateOffset"] = None,
+        include_metadata: bool = True,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+        drop_invalid_rows: bool = False,
+    ) -> "pd.DataFrame":
+        """Load front-month series synchronously (handles asyncio internally)."""
+        return asyncio.run(
+            self._async_reader.load_front_month_series(
+                ticker,
+                start=start,
+                end=end,
+                columns=columns,
+                roll_offset=roll_offset,
+                include_metadata=include_metadata,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+                drop_invalid_rows=drop_invalid_rows,
+            )
+        )
+
+    def load_scid_files(
+        self,
+        file_paths: Sequence[Union[str, Path]],
+        *,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        columns: Optional[Sequence[str]] = None,
+        include_path_column: bool = True,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, "pd.DataFrame"]:
+        """Load SCID files synchronously (handles asyncio internally)."""
+        return asyncio.run(
+            self._async_reader.load_scid_files(
+                file_paths,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                columns=columns,
+                include_path_column=include_path_column,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+            )
+        )
+
+
 __all__ = [
-    "AsyncFrontMonthScidReader",
+    "AsyncScidReader",
+    "ScidReader",
 ]
 

@@ -1,12 +1,14 @@
-from sierrapy.parser.async_scid_reader import AsyncFrontMonthScidReader
-import pandas as pd
-import numpy as np
-from pathlib import Path
-import asyncio as aio
+from sierrapy.parser import ScidReader
 
 data_path = "F:\\SierraChart\\Data"
 
-mgr = AsyncFrontMonthScidReader(data_path)
+mgr = ScidReader(data_path)
 
-data = aio.run(mgr.load_front_month_series("NG", volume_per_bar=100))
+print("Loading RB data...")
+data = mgr.load_front_month_series("RB", volume_per_bar=100, drop_invalid_rows=True)
+
+print(f"Shape: {data.shape}")
+print(f"Open range: [{data['Open'].min():.4f}, {data['Open'].max():.4f}]")
+print(f"\nFirst 5 rows:")
+print(data.head())
 

@@ -124,16 +124,17 @@ expiry) and loads multiple `.scid` files concurrently:
 import asyncio
 import sierrapy
 
+
 async def load_continuous_series():
-    reader = sierrapy.AsyncFrontMonthScidReader("/path/to/scid/folder")
+    reader = sierrapy.AsyncScidReader("/path/to/scid/folder")
 
     # Build a roll schedule (one month before expiry) and load front-month data
     df = await reader.load_front_month_series(
         "CL",
         start="2024-01-01",
         end="2024-12-31",
-        volume_per_bar=50_000,      # bucket trades into ~50k volume bars while loading
-        resample_rule="15T",        # optionally resample the stitched series to 15-minute bars
+        volume_per_bar=50_000,  # bucket trades into ~50k volume bars while loading
+        resample_rule="15T",  # optionally resample the stitched series to 15-minute bars
     )
 
     # Load multiple raw files concurrently
@@ -143,6 +144,7 @@ async def load_continuous_series():
     ], volume_per_bar=25_000)
 
     return df, raw
+
 
 continuous_df, raw_files = asyncio.run(load_continuous_series())
 print(continuous_df.head())
