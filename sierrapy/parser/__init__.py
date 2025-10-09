@@ -10,6 +10,8 @@ from .scid_parse import (
     ScidTickerFileManager,
     ScidContractInfo,
     Schema,
+    _resample_ohlcv,
+    _bucket_by_volume
 )
 from .dly_parse import (
     TickerFileManager,
@@ -29,6 +31,8 @@ resample_logic = {
                 "BidVolume":"sum",
                 "AskVolume":"sum"
                 }
+bucket_by_volume = _bucket_by_volume
+resample_ohlcv = _resample_ohlcv
 __all__ = [
     # SCID parsing
     "FastScidReader",
@@ -46,5 +50,7 @@ __all__ = [
     "parse_contract_filename",
 
     #Utilities
-    "resample_logic"
+    "resample_logic",
+    "bucket_by_volume",
+    "resample_ohlcv"
 ]

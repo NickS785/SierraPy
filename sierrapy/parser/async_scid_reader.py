@@ -59,6 +59,7 @@ class AsyncScidReader:
         loop: Optional[asyncio.AbstractEventLoop] = None,
         max_concurrency: Optional[int] = None,
     ) -> None:
+        self.reader = FastScidReader
         self._manager = ScidTickerFileManager(str(directory))
         self._loop = loop
         self._semaphore: Optional[asyncio.Semaphore] = (
