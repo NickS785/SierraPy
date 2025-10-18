@@ -29,7 +29,7 @@ import mmap
 import os
 import struct
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
 
@@ -622,6 +622,116 @@ class FastScidReader:
             chunk = v[start:end]
             yield chunk.copy() if copy else chunk
 
+    # ---------------------------- SCID export helpers ---------------------------
+    def _make_scid_header(self, record_count: int) -> bytes:
+        """Return a SCID header for ``record_count`` records.
+
+        When the source file contains a header, this clones the bytes and updates
+        the record count where possible. Otherwise a minimal 56-byte header is
+        synthesised. This keeps the output compatible with Sierra Chart readers
+        that expect the ``SCID`` signature.
+        """
+
+        header_size = self._header_size or 56
+        if self._mm is not None and self._header_size:
+            header = bytearray(self._mm[:self._header_size])
+        else:
+            header = bytearray(header_size)
+
+        if len(header) >= 4:
+            struct.pack_into("<4s", header, 0, b"SCID")
+        if len(header) >= 8:
+            struct.pack_into("<I", header, 4, len(header))
+        if len(header) >= 16:
+            struct.pack_into("<I", header, 12, self.schema.record_size)
+        if len(header) >= 20:
+            struct.pack_into("<I", header, 16, int(record_count))
+        if len(header) >= 24:
+            # Duplicate record count where legacy headers expect both start/end
+            struct.pack_into("<I", header, 20, int(record_count))
+
+        return bytes(header)
+
+    def _pack_tick_record(self, record: np.void) -> bytes:
+        """Pack a structured NumPy tick ``record`` into SCID binary layout."""
+
+        if self.schema.variant == "V10_40B":
+            fmt = "<qffffIIII"
+        else:
+            fmt = "<dffffIIII"
+
+        dt_value = record["DateTime"]
+        open_ = float(record["Open"])
+        high = float(record["High"])
+        low = float(record["Low"])
+        close = float(record["Close"])
+        num_trades = int(record["NumTrades"])
+        total_volume = int(record["TotalVolume"])
+        bid_volume = int(record["BidVolume"])
+        ask_volume = int(record["AskVolume"])
+
+        return struct.pack(
+            fmt,
+            dt_value,
+            open_,
+            high,
+            low,
+            close,
+            num_trades,
+            total_volume,
+            bid_volume,
+            ask_volume,
+        )
+
+    def _write_filtered_ticks(
+        self,
+        output_path: str,
+        ticks: Sequence[np.void] | np.ndarray,
+        *,
+        rebase_level: float | None = None,
+        preserve_tick_ratio: bool = True,
+        overwrite: bool = False,
+    ) -> None:
+        """Internal writer shared by specialised SCID exporters."""
+
+        import os
+
+        if os.path.exists(output_path) and not overwrite:
+            raise FileExistsError(f"{output_path} already exists")
+
+        if isinstance(ticks, np.ndarray):
+            if ticks.size == 0:
+                raise ValueError("No ticks selected for export")
+            data = ticks.copy()
+        else:
+            tick_list = list(ticks)
+            if not tick_list:
+                raise ValueError("No ticks selected for export")
+            data = np.array(tick_list, dtype=self.view.dtype)
+
+        if rebase_level is not None:
+            price_field = "Close" if "Close" in data.dtype.names else None
+            if price_field is None:
+                raise ValueError("Cannot rebase ticks without a Close column")
+
+            base_price = float(data[price_field][0])
+            if base_price == 0:
+                raise ValueError("Cannot rebase when base price is zero")
+
+            scale = float(rebase_level) / base_price
+            for field in ["Open", "High", "Low", "Close"]:
+                if field in data.dtype.names:
+                    data[field] = data[field] * scale
+
+            if preserve_tick_ratio and hasattr(self, "header") and hasattr(self.header, "tick_size"):
+                self.header.tick_size *= scale  # type: ignore[attr-defined]
+
+        with open(output_path, "wb") as fh:
+            fh.write(self._make_scid_header(int(data.size)))
+            for record in data:
+                fh.write(self._pack_tick_record(record))
+            fh.flush()
+
     # ------------------------------- export utils -------------------------------
     def export_csv(
         self,
@@ -941,6 +1051,153 @@ class FastScidReader:
         stats["records_per_second"] = total_records / export_time if export_time > 0 else 0
 
         return stats
+
+
+    # --------------------------- filtered SCID writers --------------------------
+    def write_scid_filtered_rebased(
+        self,
+        output_path: str,
+        dates: Sequence[date],
+        *,
+        rebase_level: float | None = None,
+        preserve_tick_ratio: bool = True,
+        overwrite: bool = False,
+    ) -> None:
+        """Export ticks whose trading date is in ``dates`` with optional rebasing.
+
+        Parameters
+        ----------
+        output_path:
+            Destination ``.scid`` path.
+        dates:
+            Iterable of :class:`datetime.date` values to retain.
+        rebase_level:
+            Optional price level to rebase the output series to.
+        preserve_tick_ratio:
+            When rebasing, also scale ``tick_size`` metadata if available.
+        overwrite:
+            Allow overwriting an existing file.
+        """
+
+        if not dates:
+            raise ValueError("dates must contain at least one entry")
+
+        day_targets = {np.datetime64(d) for d in dates}
+        day_array = self.times_epoch_ms().astype("datetime64[ms]").astype("datetime64[D]")
+        mask = np.isin(day_array, np.array(sorted(day_targets), dtype="datetime64[D]"))
+        selected = self.view[mask]
+
+        self._write_filtered_ticks(
+            output_path,
+            selected,
+            rebase_level=rebase_level,
+            preserve_tick_ratio=preserve_tick_ratio,
+            overwrite=overwrite,
+        )
+
+    def write_scid_by_date_range(
+        self,
+        output_path: str,
+        start_date: date,
+        end_date: date,
+        *,
+        rebase_level: float | None = None,
+        preserve_tick_ratio: bool = True,
+        overwrite: bool = False,
+    ) -> None:
+        """Export ticks that fall within ``start_date`` and ``end_date`` inclusive."""
+
+        if start_date > end_date:
+            raise ValueError("start_date must be on or before end_date")
+
+        days = self.times_epoch_ms().astype("datetime64[ms]").astype("datetime64[D]")
+        start = np.datetime64(start_date)
+        end = np.datetime64(end_date)
+        mask = (days >= start) & (days <= end)
+        selected = self.view[mask]
+
+        self._write_filtered_ticks(
+            output_path,
+            selected,
+            rebase_level=rebase_level,
+            preserve_tick_ratio=preserve_tick_ratio,
+            overwrite=overwrite,
+        )
+
+    def write_scid_by_calendar_filter(
+        self,
+        output_path: str,
+        *,
+        days_of_week: Optional[set[int]] = None,
+        months: Optional[set[int]] = None,
+        weeks_of_year: Optional[set[int]] = None,
+        rebase_level: float | None = None,
+        preserve_tick_ratio: bool = True,
+        overwrite: bool = False,
+    ) -> None:
+        """Export ticks filtered by calendar fields.
+
+        Parameters
+        ----------
+        output_path:
+            Destination ``.scid`` path.
+        days_of_week:
+            Integers using Python's convention ``0=Monday`` ... ``6=Sunday``.
+        months:
+            Integers ``1`` through ``12`` representing calendar months.
+        weeks_of_year:
+            ISO week numbers ``1`` through ``53``.
+        rebase_level:
+            Optional price level to rebase the output series to.
+        preserve_tick_ratio:
+            When rebasing, also scale ``tick_size`` metadata if available.
+        overwrite:
+            Allow overwriting an existing file.
+        """
+
+        if not any([days_of_week, months, weeks_of_year]):
+            raise ValueError("At least one calendar filter must be provided")
+
+        times_ms = self.times_epoch_ms()
+        dt_ms = times_ms.astype("datetime64[ms]")
+        dt_days = dt_ms.astype("datetime64[D]")
+
+        mask = np.ones(times_ms.shape, dtype=bool)
+
+        if days_of_week:
+            invalid = [d for d in days_of_week if d < 0 or d > 6]
+            if invalid:
+                raise ValueError(f"Invalid weekday values: {invalid}")
+            dow = (dt_days.astype("int64") + 3) % 7
+            mask &= np.isin(dow, list(days_of_week))
+
+        if months:
+            invalid = [m for m in months if m < 1 or m > 12]
+            if invalid:
+                raise ValueError(f"Invalid month values: {invalid}")
+            month_numbers = (dt_ms.astype("datetime64[M]").astype(int) % 12) + 1
+            mask &= np.isin(month_numbers, list(months))
+
+        if weeks_of_year:
+            invalid = [w for w in weeks_of_year if w < 1 or w > 53]
+            if invalid:
+                raise ValueError(f"Invalid ISO week values: {invalid}")
+            weeks = np.fromiter(
+                (datetime.utcfromtimestamp(int(ms) / 1000).isocalendar()[1] for ms in times_ms),
+                dtype=np.int16,
+                count=times_ms.size,
+            )
+            mask &= np.isin(weeks, list(weeks_of_year))
+
+        selected = self.view[mask]
+
+        self._write_filtered_ticks(
+            output_path,
+            selected,
+            rebase_level=rebase_level,
+            preserve_tick_ratio=preserve_tick_ratio,
+            overwrite=overwrite,
+        )
 
 
 # ---------------------------- asynchronous helper -----------------------------
