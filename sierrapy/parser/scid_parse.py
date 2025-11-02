@@ -27,6 +27,7 @@ import io
 import logging
 import mmap
 import os
+import re
 import struct
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -191,6 +192,75 @@ def _resample_ohlcv(
     result = resampled.agg(agg)
     result.index.name = frame.index.name
     return result.dropna(how="all")
+
+
+_VOLUME_RESAMPLE_PATTERN = re.compile(
+    r"^(?P<prefix>volume|vol)\s*[:=]\s*(?P<size>\d+)(?:\s*[:=]\s*(?P<column>[A-Za-z0-9_]+))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_resample_params(
+    resample_rule: Optional[str],
+    volume_per_bar: Optional[int],
+    volume_column: str = "TotalVolume",
+) -> tuple[Optional[str], Optional[int], str]:
+    """Resolve time and volume resampling parameters.
+
+    Parameters
+    ----------
+    resample_rule:
+        pandas-compatible time rule or ``"volume:<size>[:<column>]"`` shorthand.
+    volume_per_bar:
+        Explicit volume bucket size. When provided alongside a volume rule, they
+        must agree.
+    volume_column:
+        Column used for cumulative volume calculations. If the volume rule
+        specifies a column it must match any explicit value supplied.
+
+    Returns
+    -------
+    tuple
+        ``(time_rule, resolved_volume_per_bar, resolved_volume_column)`` where
+        ``time_rule`` is ``None`` for volume-based aggregation.
+    """
+
+    normalized_rule = resample_rule
+    normalized_volume = volume_per_bar
+    normalized_column = volume_column
+
+    if resample_rule:
+        match = _VOLUME_RESAMPLE_PATTERN.match(resample_rule)
+        if match:
+            normalized_rule = None
+            parsed_volume = int(match.group("size"))
+            parsed_column = match.group("column")
+
+            if parsed_volume <= 0:
+                raise ValueError("Volume bucket size must be a positive integer")
+
+            if normalized_volume is not None and normalized_volume != parsed_volume:
+                raise ValueError(
+                    "Conflicting volume bucket sizes provided via arguments and resample rule",
+                )
+
+            normalized_volume = parsed_volume
+
+            if parsed_column:
+                if (
+                    volume_column
+                    and volume_column != "TotalVolume"
+                    and volume_column != parsed_column
+                ):
+                    raise ValueError(
+                        "Conflicting volume columns provided via arguments and resample rule",
+                    )
+                normalized_column = parsed_column
+
+    if normalized_volume is not None and normalized_volume <= 0:
+        raise ValueError("volume_per_bar must be a positive integer")
+
+    return normalized_rule, normalized_volume, normalized_column
 
 
 def _bucket_by_volume(
@@ -550,12 +620,17 @@ class FastScidReader:
         if tz:
             idx = idx.tz_convert(tz)
 
+        time_rule, normalized_volume, normalized_column = normalize_resample_params(
+            resample_rule,
+            volume_per_bar,
+            volume_column,
+        )
+
         # Force copies to avoid holding references to memory-mapped buffer
         data_dict: Dict[str, np.ndarray] = {}
         ohlc_columns = {"Open", "High", "Low", "Close"}
-        for name in (
-            columns
-            or [
+        if columns is None:
+            requested_columns = [
                 "Open",
                 "High",
                 "Low",
@@ -565,7 +640,15 @@ class FastScidReader:
                 "BidVolume",
                 "AskVolume",
             ]
-        ):
+        else:
+            requested_columns = list(columns)
+
+        drop_added_volume_column = False
+        if normalized_volume is not None and normalized_column not in requested_columns:
+            requested_columns.append(normalized_column)
+            drop_added_volume_column = columns is not None
+
+        for name in requested_columns:
             if name in v.dtype.names:
                 arr = v[name].copy()  # Force copy
                 # Clean invalid sentinel values in OHLC columns
@@ -573,18 +656,16 @@ class FastScidReader:
                     arr = _clean_invalid_floats(arr)
                 data_dict[name] = arr
 
-        if volume_per_bar is not None:
-            if volume_per_bar <= 0:
-                raise ValueError("volume_per_bar must be a positive integer")
-            if volume_column not in data_dict:
+        if normalized_volume is not None:
+            if normalized_column not in data_dict:
                 raise ValueError(
-                    f"Column '{volume_column}' is required for volume bucketing"
+                    f"Column '{normalized_column}' is required for volume bucketing"
                 )
             idx, data_dict = _bucket_by_volume(
                 idx,
                 data_dict,
-                volume_per_bar=volume_per_bar,
-                volume_column=volume_column,
+                volume_per_bar=normalized_volume,
+                volume_column=normalized_column,
             )
 
         frame = pd.DataFrame(data_dict, index=idx)
@@ -598,12 +679,15 @@ class FastScidReader:
                 valid_mask = frame[price_cols].notna().all(axis=1) & (frame[price_cols] > 0).all(axis=1)
                 frame = frame[valid_mask]
 
-        if resample_rule:
+        if time_rule:
             frame = _resample_ohlcv(
                 frame,
-                resample_rule,
+                time_rule,
                 resample_kwargs=resample_kwargs,
             )
+
+        if drop_added_volume_column and normalized_column in frame.columns:
+            frame = frame.drop(columns=[normalized_column])
 
         return frame
 
@@ -919,6 +1003,10 @@ class FastScidReader:
         compression: str = "zstd",
         include_time: bool = True,
         use_dictionary: bool = False,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Mapping[str, Any]] = None,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
     ) -> Dict[str, Any]:
         """
         Optimized Parquet export with advanced features and statistics.
@@ -935,6 +1023,12 @@ class FastScidReader:
             compression: Compression algorithm ('zstd', 'snappy', 'gzip', 'lz4', 'brotli')
             include_time: Include DateTime column
             use_dictionary: Use dictionary encoding for string-like data
+            resample_rule: Optional pandas resample rule to aggregate data before export.
+                Supports ``"volume:<size>[:<column>]"`` shorthand for volume buckets.
+            resample_kwargs: Additional keyword arguments passed to ``DataFrame.resample``
+                when ``resample_rule`` is time-based.
+            volume_per_bar: Size of each volume bucket when aggregating by volume.
+            volume_column: Column that tracks cumulative volume for bucket sizing.
 
         Returns:
             Dictionary with export statistics
@@ -947,6 +1041,34 @@ class FastScidReader:
 
         sl = self.slice_by_time(start_ms=start_ms, end_ms=end_ms)
         cols = list(include_columns)
+        normalized_rule, normalized_volume, normalized_column = normalize_resample_params(
+            resample_rule,
+            volume_per_bar,
+            volume_column,
+        )
+
+        resampled_frame: Optional["pd.DataFrame"] = None
+        if normalized_rule or normalized_volume is not None:
+            read_columns = cols
+            if normalized_volume is not None and normalized_column not in read_columns:
+                read_columns = list(cols) + [normalized_column]
+
+            resampled_frame = self.to_pandas(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                columns=read_columns,
+                resample_rule=normalized_rule,
+                resample_kwargs=resample_kwargs if normalized_rule else None,
+                volume_per_bar=normalized_volume,
+                volume_column=normalized_column,
+            )
+
+            if (
+                normalized_volume is not None
+                and normalized_column not in cols
+                and normalized_column in resampled_frame.columns
+            ):
+                resampled_frame = resampled_frame.drop(columns=[normalized_column])
 
         # Build optimized Arrow schema with metadata
         schema_fields = []
@@ -988,6 +1110,8 @@ class FastScidReader:
         start_idx = sl.start or 0
         stop_idx = sl.stop or len(self)
         total_records = stop_idx - start_idx
+        if resampled_frame is not None:
+            total_records = len(resampled_frame)
 
         # Parquet writer with optimized settings
         writer_kwargs = {
@@ -998,45 +1122,88 @@ class FastScidReader:
         }
 
         with pq.ParquetWriter(out_path, schema, **writer_kwargs) as writer:
-            for chunk_start in range(start_idx, stop_idx, chunk_records):
-                chunk_end = min(chunk_start + chunk_records, stop_idx)
-                chunk_view = self.view[chunk_start:chunk_end]
+            if resampled_frame is not None:
+                for chunk_start in range(0, total_records, chunk_records):
+                    chunk_end = min(chunk_start + chunk_records, total_records)
+                    chunk = resampled_frame.iloc[chunk_start:chunk_end]
 
-                if chunk_view.size == 0:
-                    continue
+                    if chunk.empty:
+                        continue
 
-                arrays = []
+                    arrays = []
 
-                if include_time:
-                    # High-precision timestamps
-                    chunk_times = self.times_epoch_ms()[chunk_start:chunk_end]
-                    # Convert to microseconds for higher precision
-                    time_us = chunk_times * 1000
-                    time_array = pa.array(time_us, type=pa.timestamp("us", tz="UTC"))
-                    arrays.append(time_array)
+                    if include_time:
+                        index_us = (chunk.index.asi8 // 1000).astype(np.int64)
+                        time_array = pa.array(index_us, type=pa.timestamp("us", tz="UTC"))
+                        arrays.append(time_array)
 
-                # Process data columns
-                for col in cols:
-                    if col in chunk_view.dtype.names:
-                        col_data = chunk_view[col]
+                    for col in cols:
+                        if col not in chunk.columns:
+                            null_array = pa.nulls(len(chunk), type=schema.field(col).type)
+                            arrays.append(null_array)
+                            continue
+
+                        col_data = chunk[col].to_numpy()
 
                         if col in ["Open", "High", "Low", "Close"]:
                             arrow_array = pa.array(col_data.astype(np.float32))
                         elif col in ["NumTrades", "TotalVolume", "BidVolume", "AskVolume"]:
-                            arrow_array = pa.array(col_data.astype(np.uint32))
+                            safe_data = np.nan_to_num(col_data, nan=0.0)
+                            arrow_array = pa.array(safe_data.astype(np.uint32))
                         else:
                             arrow_array = pa.array(col_data.astype(np.float32))
 
                         arrays.append(arrow_array)
 
-                # Write batch
-                batch = pa.record_batch(arrays, schema=schema)
-                writer.write_batch(batch)
+                    batch = pa.record_batch(arrays, schema=schema)
+                    writer.write_batch(batch)
 
-                # Update statistics
-                stats["chunks_processed"] += 1
-                stats["total_records"] += len(chunk_view)
-                stats["bytes_processed"] += chunk_view.nbytes
+                    stats["chunks_processed"] += 1
+                    stats["total_records"] += len(chunk)
+                    stats["bytes_processed"] += int(chunk.memory_usage(deep=True).sum())
+            else:
+                for chunk_start in range(start_idx, stop_idx, chunk_records):
+                    chunk_end = min(chunk_start + chunk_records, stop_idx)
+                    chunk_view = self.view[chunk_start:chunk_end]
+
+                    if chunk_view.size == 0:
+                        continue
+
+                    arrays = []
+
+                    if include_time:
+                        # High-precision timestamps
+                        chunk_times = self.times_epoch_ms()[chunk_start:chunk_end]
+                        # Convert to microseconds for higher precision
+                        time_us = chunk_times * 1000
+                        time_array = pa.array(time_us, type=pa.timestamp("us", tz="UTC"))
+                        arrays.append(time_array)
+
+                    # Process data columns
+                    for col in cols:
+                        if col in chunk_view.dtype.names:
+                            col_data = chunk_view[col]
+
+                            if col in ["Open", "High", "Low", "Close"]:
+                                arrow_array = pa.array(col_data.astype(np.float32))
+                            elif col in ["NumTrades", "TotalVolume", "BidVolume", "AskVolume"]:
+                                arrow_array = pa.array(col_data.astype(np.uint32))
+                            else:
+                                arrow_array = pa.array(col_data.astype(np.float32))
+
+                            arrays.append(arrow_array)
+                        else:
+                            null_array = pa.nulls(len(chunk_view), type=schema.field(col).type)
+                            arrays.append(null_array)
+
+                    # Write batch
+                    batch = pa.record_batch(arrays, schema=schema)
+                    writer.write_batch(batch)
+
+                    # Update statistics
+                    stats["chunks_processed"] += 1
+                    stats["total_records"] += len(chunk_view)
+                    stats["bytes_processed"] += chunk_view.nbytes
 
         # Calculate final statistics
         export_time = time.perf_counter() - start_time

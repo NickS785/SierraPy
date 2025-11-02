@@ -4,10 +4,11 @@ import asyncio
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from sierrapy.parser import async_scid_reader as asc
 from sierrapy.parser.async_scid_reader import AsyncScidReader
-from sierrapy.parser.scid_parse import RollPeriod, ScidContractInfo
+from sierrapy.parser.scid_parse import RollPeriod, ScidContractInfo, normalize_resample_params
 
 
 _created_readers: list["_DummyFastReader"] = []
@@ -19,6 +20,7 @@ class _DummyFastReader:
         self.path = path
         self.start_ms: int | None = None
         self.end_ms: int | None = None
+        self.kwargs: dict | None = None
         _created_readers.append(self)
 
     def open(self) -> "_DummyFastReader":
@@ -33,6 +35,7 @@ class _DummyFastReader:
     def to_pandas(self, *, start_ms=None, end_ms=None, **kwargs):
         self.start_ms = start_ms
         self.end_ms = end_ms
+        self.kwargs = kwargs
 
         idx = pd.to_datetime(
             [
@@ -50,6 +53,7 @@ class _DummyFastReader:
             "Low": [1, 2, 3, 4, 5],
             "Close": [1, 2, 3, 4, 5],
             "TotalVolume": [10, 20, 30, 40, 50],
+            "BidVolume": [5, 5, 5, 5, 5],
         }
 
         frame = pd.DataFrame(data, index=idx)
@@ -61,6 +65,15 @@ class _DummyParquetFastReader:
     def __init__(self, path: str) -> None:
         self.path = path
         Path(path).touch()
+
+    def open(self) -> "_DummyParquetFastReader":
+        return self
+
+    def __enter__(self) -> "_DummyParquetFastReader":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
 
     def export_to_parquet_optimized(self, out_path: str, **kwargs):
         record = (self.path, out_path, kwargs)
@@ -127,12 +140,77 @@ def test_read_period_limits_contract_window(monkeypatch):
 
     assert dummy_reader.start_ms == expected_start_ms
     assert dummy_reader.end_ms == expected_end_ms
+    assert dummy_reader.kwargs == {
+        "columns": None,
+        "volume_per_bar": None,
+        "volume_column": "TotalVolume",
+        "resample_rule": None,
+        "resample_kwargs": None,
+        "drop_invalid_rows": False,
+    }
 
     assert (df.index >= start).all()
     assert (df.index < end).all()
 
     # Metadata is preserved and only one contract is present for the window.
     assert set(df["Contract"].unique()) == {contract.contract_id}
+
+
+def test_load_front_month_series_volume_rule(monkeypatch):
+    _created_readers.clear()
+
+    reader = AsyncScidReader("/tmp")
+
+    monkeypatch.setattr(asc, "FastScidReader", _DummyFastReader)
+
+    async def run_sync(func):
+        return func()
+
+    monkeypatch.setattr(reader, "_run_in_executor", run_sync)
+
+    contract = ScidContractInfo(
+        ticker="NG",
+        month="V",
+        year=2025,
+        exchange="NYM",
+        file_path=Path("/fake/path"),
+    )
+
+    start = pd.Timestamp("2025-09-20T00:00:00Z")
+    end = pd.Timestamp("2025-10-20T00:00:00Z")
+
+    roll_date = start + pd.Timedelta(hours=1)
+
+    period = RollPeriod(
+        contract=contract,
+        start=start,
+        end=end,
+        roll_date=roll_date,
+        expiry=end,
+    )
+
+    monkeypatch.setattr(reader.manager, "generate_roll_schedule", lambda *args, **kwargs: [period])
+
+    df = asyncio.run(
+        reader.load_front_month_series(
+            "NG",
+            start=start,
+            end=end,
+            columns=["Open"],
+            include_metadata=False,
+            resample_rule="volume:30",
+        )
+    )
+
+    dummy_reader = _created_readers[-1]
+
+    assert dummy_reader.kwargs["volume_per_bar"] == 30
+    assert dummy_reader.kwargs["volume_column"] == "TotalVolume"
+    assert dummy_reader.kwargs["resample_rule"] is None
+    assert dummy_reader.kwargs["resample_kwargs"] is None
+
+    assert "TotalVolume" not in df.columns
+    assert not df.empty
 
 
 def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
@@ -168,6 +246,10 @@ def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
             compression="snappy",
             include_time=False,
             use_dictionary=True,
+            resample_rule="volume:500:BidVolume",
+            resample_kwargs={"label": "right"},
+            volume_per_bar=None,
+            volume_column="BidVolume",
         )
     )
 
@@ -187,9 +269,37 @@ def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
     assert call_a[2]["compression"] == "snappy"
     assert call_a[2]["include_time"] is False
     assert call_a[2]["use_dictionary"] is True
+    assert call_a[2]["resample_rule"] is None
+    assert call_a[2]["resample_kwargs"] is None
+    assert call_a[2]["volume_per_bar"] == 500
+    assert call_a[2]["volume_column"] == "BidVolume"
 
     call_b = export_map[source_b]
     assert call_b[1] == str(target_b)
 
     assert stats[str(source_a)]["output"] == str(target_a)
     assert stats[str(source_b)]["output"] == str(target_b)
+
+
+def test_normalize_resample_params_time_rule():
+    rule, volume, column = normalize_resample_params("5T", None, "TotalVolume")
+
+    assert rule == "5T"
+    assert volume is None
+    assert column == "TotalVolume"
+
+
+def test_normalize_resample_params_volume_rule():
+    rule, volume, column = normalize_resample_params("volume:250:BidVolume", None, "TotalVolume")
+
+    assert rule is None
+    assert volume == 250
+    assert column == "BidVolume"
+
+
+def test_normalize_resample_params_conflicts():
+    with pytest.raises(ValueError):
+        normalize_resample_params("volume:250", 100, "TotalVolume")
+
+    with pytest.raises(ValueError):
+        normalize_resample_params("volume:250:BidVolume", None, "AskVolume")
