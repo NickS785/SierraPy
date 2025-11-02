@@ -177,6 +177,8 @@ def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
             compression="snappy",
             include_time=False,
             use_dictionary=True,
+            resample_rule="5T",
+            resample_kwargs={"label": "right"},
         )
     )
 
@@ -196,6 +198,8 @@ def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
     assert call_a[2]["compression"] == "snappy"
     assert call_a[2]["include_time"] is False
     assert call_a[2]["use_dictionary"] is True
+    assert call_a[2]["resample_rule"] == "5T"
+    assert call_a[2]["resample_kwargs"] == {"label": "right"}
 
     call_b = export_map[source_b]
     assert call_b[1] == str(target_b)
