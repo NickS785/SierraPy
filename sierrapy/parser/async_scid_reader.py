@@ -211,6 +211,68 @@ class AsyncScidReader:
         await asyncio.gather(*(_read_and_store(path) for path in normalized))
         return results
 
+    async def export_scid_files_to_parquet(
+        self,
+        exports: Sequence[tuple[Union[str, Path], Union[str, Path]]],
+        *,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        include_columns: Sequence[str] = (
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "NumTrades",
+            "TotalVolume",
+            "BidVolume",
+            "AskVolume",
+        ),
+        chunk_records: int = 2_000_000,
+        compression: str = "zstd",
+        include_time: bool = True,
+        use_dictionary: bool = False,
+        create_parent_dirs: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Export multiple SCID files to Parquet concurrently.
+
+        Parameters
+        ----------
+        exports:
+            Sequence of ``(scid_path, parquet_path)`` tuples to export.
+        start_ms, end_ms, include_columns, chunk_records, compression,
+        include_time, use_dictionary:
+            Forwarded to :meth:`FastScidReader.export_to_parquet_optimized`.
+        create_parent_dirs:
+            When ``True`` (default), ensure the destination directory exists.
+
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Mapping of source SCID path to the statistics returned by
+            :meth:`FastScidReader.export_to_parquet_optimized`.
+        """
+
+        normalized = [(Path(src), Path(dst)) for src, dst in exports]
+        results: Dict[str, Dict[str, Any]] = {}
+
+        async def _export(src: Path, dst: Path) -> None:
+            stats = await self._export_file_to_parquet(
+                src,
+                dst,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                include_columns=include_columns,
+                chunk_records=chunk_records,
+                compression=compression,
+                include_time=include_time,
+                use_dictionary=use_dictionary,
+                create_parent_dirs=create_parent_dirs,
+            )
+            results[str(src)] = stats
+
+        await asyncio.gather(*(_export(src, dst) for src, dst in normalized))
+        return results
+
     async def _read_period(
         self,
         period: RollPeriod,
@@ -325,7 +387,43 @@ class AsyncScidReader:
         if drop_volume_column and volume_column in df.columns:
             df = df.drop(columns=[volume_column])
         return df
-                
+
+    async def _export_file_to_parquet(
+        self,
+        src: Path,
+        dst: Path,
+        *,
+        start_ms: Optional[int],
+        end_ms: Optional[int],
+        include_columns: Sequence[str],
+        chunk_records: int,
+        compression: str,
+        include_time: bool,
+        use_dictionary: bool,
+        create_parent_dirs: bool,
+    ) -> Dict[str, Any]:
+        def _export() -> Dict[str, Any]:
+            if not src.exists():
+                self._logger.warning("SCID file not found: %s", src)
+                return {}
+
+            if create_parent_dirs:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+
+            reader = FastScidReader(str(src))
+            return reader.export_to_parquet_optimized(
+                str(dst),
+                start_ms=start_ms,
+                end_ms=end_ms,
+                include_columns=include_columns,
+                chunk_records=chunk_records,
+                compression=compression,
+                include_time=include_time,
+                use_dictionary=use_dictionary,
+            )
+
+        return await self._run_in_executor(_export)
+
 
     async def _run_in_executor(self, func: Callable[[], T]) -> T:
         if self._semaphore is None:
@@ -434,6 +532,44 @@ class ScidReader:
                 volume_column=volume_column,
                 resample_rule=resample_rule,
                 resample_kwargs=resample_kwargs,
+            )
+        )
+
+    def export_scid_files_to_parquet(
+        self,
+        exports: Sequence[tuple[Union[str, Path], Union[str, Path]]],
+        *,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        include_columns: Sequence[str] = (
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "NumTrades",
+            "TotalVolume",
+            "BidVolume",
+            "AskVolume",
+        ),
+        chunk_records: int = 2_000_000,
+        compression: str = "zstd",
+        include_time: bool = True,
+        use_dictionary: bool = False,
+        create_parent_dirs: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Synchronous wrapper around asynchronous Parquet export."""
+
+        return asyncio.run(
+            self._async_reader.export_scid_files_to_parquet(
+                exports,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                include_columns=include_columns,
+                chunk_records=chunk_records,
+                compression=compression,
+                include_time=include_time,
+                use_dictionary=use_dictionary,
+                create_parent_dirs=create_parent_dirs,
             )
         )
 
