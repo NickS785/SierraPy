@@ -410,17 +410,17 @@ class AsyncScidReader:
             if create_parent_dirs:
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-            reader = FastScidReader(str(src))
-            return reader.export_to_parquet_optimized(
-                str(dst),
-                start_ms=start_ms,
-                end_ms=end_ms,
-                include_columns=include_columns,
-                chunk_records=chunk_records,
-                compression=compression,
-                include_time=include_time,
-                use_dictionary=use_dictionary,
-            )
+            with FastScidReader(str(src)).open() as reader:
+                return reader.export_to_parquet_optimized(
+                    str(dst),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    include_columns=include_columns,
+                    chunk_records=chunk_records,
+                    compression=compression,
+                    include_time=include_time,
+                    use_dictionary=use_dictionary,
+                )
 
         return await self._run_in_executor(_export)
 

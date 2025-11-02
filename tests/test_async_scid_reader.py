@@ -62,6 +62,15 @@ class _DummyParquetFastReader:
         self.path = path
         Path(path).touch()
 
+    def open(self) -> "_DummyParquetFastReader":
+        return self
+
+    def __enter__(self) -> "_DummyParquetFastReader":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
     def export_to_parquet_optimized(self, out_path: str, **kwargs):
         record = (self.path, out_path, kwargs)
         _parquet_exports.append(record)
