@@ -8,7 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
-from .scid_parse import FastScidReader, RollPeriod, ScidTickerFileManager
+from .scid_parse import (
+    FastScidReader,
+    RollPeriod,
+    ScidTickerFileManager,
+    normalize_resample_params,
+)
 
 try:  # Optional dependency (aligned with FastScidReader)
     import pandas as pd
@@ -109,14 +114,20 @@ class AsyncScidReader:
         start_ts = _coerce_timestamp(start)
         end_ts = _coerce_timestamp(end)
 
+        normalized_rule, normalized_volume_per_bar, normalized_volume_column = normalize_resample_params(
+            resample_rule,
+            volume_per_bar,
+            volume_column,
+        )
+
         effective_columns: Optional[List[str]] = None
         drop_volume_column = False
         if columns is not None:
             effective_columns = list(columns)
 
-        if volume_per_bar is not None and effective_columns is not None:
-            if volume_column not in effective_columns:
-                effective_columns.append(volume_column)
+        if normalized_volume_per_bar is not None and effective_columns is not None:
+            if normalized_volume_column not in effective_columns:
+                effective_columns.append(normalized_volume_column)
                 drop_volume_column = True
 
         periods = self._manager.generate_roll_schedule(
@@ -134,10 +145,10 @@ class AsyncScidReader:
                 period,
                 columns=effective_columns or columns,
                 include_metadata=include_metadata,
-                volume_per_bar=volume_per_bar,
-                volume_column=volume_column,
-                resample_rule=resample_rule,
-                resample_kwargs=resample_kwargs,
+                volume_per_bar=normalized_volume_per_bar,
+                volume_column=normalized_volume_column,
+                resample_rule=normalized_rule,
+                resample_kwargs=resample_kwargs if normalized_rule else None,
                 drop_volume_column=drop_volume_column,
                 drop_invalid_rows=drop_invalid_rows,
             )
@@ -178,14 +189,20 @@ class AsyncScidReader:
     ) -> Dict[str, "pd.DataFrame"]:
         _ensure_pandas()
 
+        normalized_rule, normalized_volume_per_bar, normalized_volume_column = normalize_resample_params(
+            resample_rule,
+            volume_per_bar,
+            volume_column,
+        )
+
         effective_columns: Optional[List[str]] = None
         drop_volume_column = False
         if columns is not None:
             effective_columns = list(columns)
 
-        if volume_per_bar is not None and effective_columns is not None:
-            if volume_column not in effective_columns:
-                effective_columns.append(volume_column)
+        if normalized_volume_per_bar is not None and effective_columns is not None:
+            if normalized_volume_column not in effective_columns:
+                effective_columns.append(normalized_volume_column)
                 drop_volume_column = True
 
         normalized: List[Path] = [Path(path) for path in file_paths]
@@ -197,10 +214,10 @@ class AsyncScidReader:
                 start_ms=start_ms,
                 end_ms=end_ms,
                 columns=effective_columns or columns,
-                volume_per_bar=volume_per_bar,
-                volume_column=volume_column,
-                resample_rule=resample_rule,
-                resample_kwargs=resample_kwargs,
+                volume_per_bar=normalized_volume_per_bar,
+                volume_column=normalized_volume_column,
+                resample_rule=normalized_rule,
+                resample_kwargs=resample_kwargs if normalized_rule else None,
                 drop_volume_column=drop_volume_column,
             )
             if include_path_column and not df.empty:
@@ -232,6 +249,10 @@ class AsyncScidReader:
         include_time: bool = True,
         use_dictionary: bool = False,
         create_parent_dirs: bool = True,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
     ) -> Dict[str, Dict[str, Any]]:
         """Export multiple SCID files to Parquet concurrently.
 
@@ -244,6 +265,13 @@ class AsyncScidReader:
             Forwarded to :meth:`FastScidReader.export_to_parquet_optimized`.
         create_parent_dirs:
             When ``True`` (default), ensure the destination directory exists.
+        resample_rule, resample_kwargs:
+            Forwarded to :meth:`FastScidReader.export_to_parquet_optimized` to
+            optionally resample data before export. ``resample_rule`` may also
+            use the ``"volume:<size>[:<column>]"`` shorthand to request volume
+            bucket aggregation.
+        volume_per_bar, volume_column:
+            Additional volume bucketing controls forwarded to the export helper.
 
         Returns
         -------
@@ -253,6 +281,12 @@ class AsyncScidReader:
         """
 
         normalized = [(Path(src), Path(dst)) for src, dst in exports]
+        normalized_rule, normalized_volume_per_bar, normalized_volume_column = normalize_resample_params(
+            resample_rule,
+            volume_per_bar,
+            volume_column,
+        )
+        effective_resample_kwargs = resample_kwargs if normalized_rule else None
         results: Dict[str, Dict[str, Any]] = {}
 
         async def _export(src: Path, dst: Path) -> None:
@@ -267,6 +301,10 @@ class AsyncScidReader:
                 include_time=include_time,
                 use_dictionary=use_dictionary,
                 create_parent_dirs=create_parent_dirs,
+                resample_rule=normalized_rule,
+                resample_kwargs=effective_resample_kwargs,
+                volume_per_bar=normalized_volume_per_bar,
+                volume_column=normalized_volume_column,
             )
             results[str(src)] = stats
 
@@ -401,6 +439,10 @@ class AsyncScidReader:
         include_time: bool,
         use_dictionary: bool,
         create_parent_dirs: bool,
+        resample_rule: Optional[str],
+        resample_kwargs: Optional[Dict[str, Any]],
+        volume_per_bar: Optional[int],
+        volume_column: str,
     ) -> Dict[str, Any]:
         def _export() -> Dict[str, Any]:
             if not src.exists():
@@ -410,17 +452,21 @@ class AsyncScidReader:
             if create_parent_dirs:
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-            reader = FastScidReader(str(src))
-            return reader.export_to_parquet_optimized(
-                str(dst),
-                start_ms=start_ms,
-                end_ms=end_ms,
-                include_columns=include_columns,
-                chunk_records=chunk_records,
-                compression=compression,
-                include_time=include_time,
-                use_dictionary=use_dictionary,
-            )
+            with FastScidReader(str(src)).open() as reader:
+                return reader.export_to_parquet_optimized(
+                    str(dst),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    include_columns=include_columns,
+                    chunk_records=chunk_records,
+                    compression=compression,
+                    include_time=include_time,
+                    use_dictionary=use_dictionary,
+                    resample_rule=resample_rule,
+                    resample_kwargs=resample_kwargs,
+                    volume_per_bar=volume_per_bar,
+                    volume_column=volume_column,
+                )
 
         return await self._run_in_executor(_export)
 
@@ -556,6 +602,10 @@ class ScidReader:
         include_time: bool = True,
         use_dictionary: bool = False,
         create_parent_dirs: bool = True,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
     ) -> Dict[str, Dict[str, Any]]:
         """Synchronous wrapper around asynchronous Parquet export."""
 
@@ -570,6 +620,10 @@ class ScidReader:
                 include_time=include_time,
                 use_dictionary=use_dictionary,
                 create_parent_dirs=create_parent_dirs,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
             )
         )
 
