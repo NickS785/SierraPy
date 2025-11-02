@@ -232,6 +232,8 @@ class AsyncScidReader:
         include_time: bool = True,
         use_dictionary: bool = False,
         create_parent_dirs: bool = True,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Export multiple SCID files to Parquet concurrently.
 
@@ -244,6 +246,9 @@ class AsyncScidReader:
             Forwarded to :meth:`FastScidReader.export_to_parquet_optimized`.
         create_parent_dirs:
             When ``True`` (default), ensure the destination directory exists.
+        resample_rule, resample_kwargs:
+            Forwarded to :meth:`FastScidReader.export_to_parquet_optimized` to
+            optionally resample data before export.
 
         Returns
         -------
@@ -267,6 +272,8 @@ class AsyncScidReader:
                 include_time=include_time,
                 use_dictionary=use_dictionary,
                 create_parent_dirs=create_parent_dirs,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
             )
             results[str(src)] = stats
 
@@ -401,6 +408,8 @@ class AsyncScidReader:
         include_time: bool,
         use_dictionary: bool,
         create_parent_dirs: bool,
+        resample_rule: Optional[str],
+        resample_kwargs: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         def _export() -> Dict[str, Any]:
             if not src.exists():
@@ -410,17 +419,19 @@ class AsyncScidReader:
             if create_parent_dirs:
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-            reader = FastScidReader(str(src))
-            return reader.export_to_parquet_optimized(
-                str(dst),
-                start_ms=start_ms,
-                end_ms=end_ms,
-                include_columns=include_columns,
-                chunk_records=chunk_records,
-                compression=compression,
-                include_time=include_time,
-                use_dictionary=use_dictionary,
-            )
+            with FastScidReader(str(src)).open() as reader:
+                return reader.export_to_parquet_optimized(
+                    str(dst),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    include_columns=include_columns,
+                    chunk_records=chunk_records,
+                    compression=compression,
+                    include_time=include_time,
+                    use_dictionary=use_dictionary,
+                    resample_rule=resample_rule,
+                    resample_kwargs=resample_kwargs,
+                )
 
         return await self._run_in_executor(_export)
 
@@ -556,6 +567,8 @@ class ScidReader:
         include_time: bool = True,
         use_dictionary: bool = False,
         create_parent_dirs: bool = True,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Synchronous wrapper around asynchronous Parquet export."""
 
@@ -570,6 +583,8 @@ class ScidReader:
                 include_time=include_time,
                 use_dictionary=use_dictionary,
                 create_parent_dirs=create_parent_dirs,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
             )
         )
 

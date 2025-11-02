@@ -919,6 +919,8 @@ class FastScidReader:
         compression: str = "zstd",
         include_time: bool = True,
         use_dictionary: bool = False,
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Optimized Parquet export with advanced features and statistics.
@@ -935,6 +937,8 @@ class FastScidReader:
             compression: Compression algorithm ('zstd', 'snappy', 'gzip', 'lz4', 'brotli')
             include_time: Include DateTime column
             use_dictionary: Use dictionary encoding for string-like data
+            resample_rule: Optional pandas resample rule to aggregate data before export
+            resample_kwargs: Additional keyword arguments passed to ``DataFrame.resample``
 
         Returns:
             Dictionary with export statistics
@@ -947,6 +951,15 @@ class FastScidReader:
 
         sl = self.slice_by_time(start_ms=start_ms, end_ms=end_ms)
         cols = list(include_columns)
+        resampled_frame: Optional["pd.DataFrame"] = None
+        if resample_rule:
+            resampled_frame = self.to_pandas(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                columns=cols,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+            )
 
         # Build optimized Arrow schema with metadata
         schema_fields = []
@@ -988,6 +1001,8 @@ class FastScidReader:
         start_idx = sl.start or 0
         stop_idx = sl.stop or len(self)
         total_records = stop_idx - start_idx
+        if resampled_frame is not None:
+            total_records = len(resampled_frame)
 
         # Parquet writer with optimized settings
         writer_kwargs = {
@@ -998,45 +1013,88 @@ class FastScidReader:
         }
 
         with pq.ParquetWriter(out_path, schema, **writer_kwargs) as writer:
-            for chunk_start in range(start_idx, stop_idx, chunk_records):
-                chunk_end = min(chunk_start + chunk_records, stop_idx)
-                chunk_view = self.view[chunk_start:chunk_end]
+            if resampled_frame is not None:
+                for chunk_start in range(0, total_records, chunk_records):
+                    chunk_end = min(chunk_start + chunk_records, total_records)
+                    chunk = resampled_frame.iloc[chunk_start:chunk_end]
 
-                if chunk_view.size == 0:
-                    continue
+                    if chunk.empty:
+                        continue
 
-                arrays = []
+                    arrays = []
 
-                if include_time:
-                    # High-precision timestamps
-                    chunk_times = self.times_epoch_ms()[chunk_start:chunk_end]
-                    # Convert to microseconds for higher precision
-                    time_us = chunk_times * 1000
-                    time_array = pa.array(time_us, type=pa.timestamp("us", tz="UTC"))
-                    arrays.append(time_array)
+                    if include_time:
+                        index_us = (chunk.index.asi8 // 1000).astype(np.int64)
+                        time_array = pa.array(index_us, type=pa.timestamp("us", tz="UTC"))
+                        arrays.append(time_array)
 
-                # Process data columns
-                for col in cols:
-                    if col in chunk_view.dtype.names:
-                        col_data = chunk_view[col]
+                    for col in cols:
+                        if col not in chunk.columns:
+                            null_array = pa.nulls(len(chunk), type=schema.field(col).type)
+                            arrays.append(null_array)
+                            continue
+
+                        col_data = chunk[col].to_numpy()
 
                         if col in ["Open", "High", "Low", "Close"]:
                             arrow_array = pa.array(col_data.astype(np.float32))
                         elif col in ["NumTrades", "TotalVolume", "BidVolume", "AskVolume"]:
-                            arrow_array = pa.array(col_data.astype(np.uint32))
+                            safe_data = np.nan_to_num(col_data, nan=0.0)
+                            arrow_array = pa.array(safe_data.astype(np.uint32))
                         else:
                             arrow_array = pa.array(col_data.astype(np.float32))
 
                         arrays.append(arrow_array)
 
-                # Write batch
-                batch = pa.record_batch(arrays, schema=schema)
-                writer.write_batch(batch)
+                    batch = pa.record_batch(arrays, schema=schema)
+                    writer.write_batch(batch)
 
-                # Update statistics
-                stats["chunks_processed"] += 1
-                stats["total_records"] += len(chunk_view)
-                stats["bytes_processed"] += chunk_view.nbytes
+                    stats["chunks_processed"] += 1
+                    stats["total_records"] += len(chunk)
+                    stats["bytes_processed"] += int(chunk.memory_usage(deep=True).sum())
+            else:
+                for chunk_start in range(start_idx, stop_idx, chunk_records):
+                    chunk_end = min(chunk_start + chunk_records, stop_idx)
+                    chunk_view = self.view[chunk_start:chunk_end]
+
+                    if chunk_view.size == 0:
+                        continue
+
+                    arrays = []
+
+                    if include_time:
+                        # High-precision timestamps
+                        chunk_times = self.times_epoch_ms()[chunk_start:chunk_end]
+                        # Convert to microseconds for higher precision
+                        time_us = chunk_times * 1000
+                        time_array = pa.array(time_us, type=pa.timestamp("us", tz="UTC"))
+                        arrays.append(time_array)
+
+                    # Process data columns
+                    for col in cols:
+                        if col in chunk_view.dtype.names:
+                            col_data = chunk_view[col]
+
+                            if col in ["Open", "High", "Low", "Close"]:
+                                arrow_array = pa.array(col_data.astype(np.float32))
+                            elif col in ["NumTrades", "TotalVolume", "BidVolume", "AskVolume"]:
+                                arrow_array = pa.array(col_data.astype(np.uint32))
+                            else:
+                                arrow_array = pa.array(col_data.astype(np.float32))
+
+                            arrays.append(arrow_array)
+                        else:
+                            null_array = pa.nulls(len(chunk_view), type=schema.field(col).type)
+                            arrays.append(null_array)
+
+                    # Write batch
+                    batch = pa.record_batch(arrays, schema=schema)
+                    writer.write_batch(batch)
+
+                    # Update statistics
+                    stats["chunks_processed"] += 1
+                    stats["total_records"] += len(chunk_view)
+                    stats["bytes_processed"] += chunk_view.nbytes
 
         # Calculate final statistics
         export_time = time.perf_counter() - start_time
