@@ -189,8 +189,14 @@ def _resample_ohlcv(
     if agg is None:
         agg = _default_ohlcv_aggregation(frame.columns)
 
+    open_from_close = None
+    if "Close" in frame.columns:
+        open_from_close = resampled["Close"].first()
+
     result = resampled.agg(agg)
     result.index.name = frame.index.name
+    if open_from_close is not None:
+        result["Open"] = open_from_close
     return result.dropna(how="all")
 
 
