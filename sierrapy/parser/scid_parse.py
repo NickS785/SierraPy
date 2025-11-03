@@ -291,6 +291,7 @@ class FastScidReader:
         self._mm: Optional[mmap.mmap] = None
         self._schema: Optional[Schema] = None
         self._np_view: Optional[np.ndarray] = None  # structured array view
+        self._timestamps_view: Optional[np.ndarray] = None
         self._header_size: int = 0  # Size of header to skip
 
     # ------------------------------ context manager ------------------------------
@@ -326,12 +327,17 @@ class FastScidReader:
 
         # Zero-copy structured array view over the data portion (skip header)
         self._np_view = np.frombuffer(self._mm, dtype=schema.dtype, offset=self._header_size)
+        if "DateTime" not in (self._np_view.dtype.names or ()):  # pragma: no cover - defensive
+            raise RuntimeError("Timestamp field 'DateTime' missing from schema dtype")
+        self._timestamps_view = self._np_view["DateTime"]
         return self
 
     def close(self) -> None:
         # Clear references to numpy arrays that might hold buffer references
         if hasattr(self, '_np_view'):
             self._np_view = None
+        if hasattr(self, '_timestamps_view'):
+            self._timestamps_view = None
 
         # Close memory map with enhanced BufferError handling
         if self._mm is not None:
@@ -466,6 +472,11 @@ class FastScidReader:
         return data_size // self._schema.record_size
 
     @property
+    def count(self) -> int:
+        """Number of records available in the mapped SCID file."""
+        return len(self)
+
+    @property
     def view(self) -> np.ndarray:
         """Structured array view over the file (zero-copy)."""
         if self._np_view is None:
@@ -489,6 +500,57 @@ class FastScidReader:
             # Legacy format: float64 days since 1899-12-30
             days = v["DateTime"].astype(np.float64, copy=True)  # Force copy
             return _sc_days_to_epoch_ms(days)  # int64 array
+
+    def _convert_raw_timestamp(self, raw: Any) -> int:
+        if self._schema is None or self._timestamps_view is None:
+            raise RuntimeError("Reader not opened")
+        if self._schema.variant == "V10_40B":
+            return int(_sc_microseconds_to_epoch_ms(int(raw)))
+        return int(_sc_days_to_epoch_ms(float(raw)))
+
+    def read_timestamp(self, i: int) -> int:
+        """Return the timestamp at index ``i`` in epoch milliseconds (UTC).
+
+        This operation performs O(1) I/O, allocates no additional memory, and
+        raises :class:`IndexError` if the requested index is out of range.  A
+        negative index is interpreted relative to the end of the file, matching
+        Python sequence semantics.
+        """
+
+        if self._timestamps_view is None:
+            raise RuntimeError("Reader not opened")
+
+        n = self.count
+        if n == 0:
+            raise IndexError("empty scid")
+
+        if i < 0:
+            i += n
+
+        if not 0 <= i < n:
+            raise IndexError(i)
+
+        raw_value = self._timestamps_view[i]
+        return self._convert_raw_timestamp(raw_value)
+
+    def peek_range(self) -> tuple[int, Optional[int], Optional[int]]:
+        """Return ``(count, start_ms, end_ms)`` for the mapped SCID file.
+
+        The timestamps are UNIX epoch milliseconds (UTC).  When the file has no
+        records this returns ``(0, None, None)``.  The operation is O(1), zero
+        allocation, and safe to call repeatedly.
+        """
+
+        n = self.count
+        if n == 0:
+            return 0, None, None
+
+        if self._timestamps_view is None:
+            raise RuntimeError("Reader not opened")
+
+        start_raw = self._timestamps_view[0]
+        end_raw = self._timestamps_view[n - 1]
+        return n, self._convert_raw_timestamp(start_raw), self._convert_raw_timestamp(end_raw)
 
     def searchsorted(self, ts_ms: int, *, side: Literal["left", "right"] = "left") -> int:
         """Binary search index for a timestamp in epoch milliseconds.
