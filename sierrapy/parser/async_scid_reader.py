@@ -126,6 +126,7 @@ class AsyncScidReader:
         resample_rule: Optional[str] = None,
         resample_kwargs: Optional[Dict[str, Any]] = None,
         drop_invalid_rows: bool = False,
+        preflight_peek: bool = False,
 
     ) -> "pd.DataFrame":
         frame_pd = _ensure_pandas()
@@ -153,6 +154,48 @@ class AsyncScidReader:
 
         if not periods:
             return frame_pd.DataFrame()
+
+        if preflight_peek:
+            filtered_periods: List[RollPeriod] = []
+            total_periods = len(periods)
+            for idx, period in enumerate(periods):
+                is_last_period = idx == total_periods - 1
+                try:
+                    with FastScidReader(str(period.contract.file_path), read_only=True).open() as reader:
+                        try:
+                            count, first_ms, last_ms = reader.peek_range()
+                        except AttributeError:
+                            times = reader.times_epoch_ms()
+                            count = len(times)
+                            if count == 0:
+                                first_ms = last_ms = None
+                            else:
+                                first_ms = int(times[0])
+                                last_ms = int(times[-1])
+                except Exception:
+                    filtered_periods.append(period)
+                    continue
+
+                if count == 0 or first_ms is None or last_ms is None:
+                    continue
+
+                period_start_ms = _timestamp_to_epoch_ms(period.start)
+                period_end_ms_exclusive = _timestamp_to_epoch_ms(period.end)
+
+                if period_end_ms_exclusive is not None and first_ms >= period_end_ms_exclusive:
+                    continue
+                if (
+                    period_start_ms is not None
+                    and last_ms < period_start_ms
+                    and not is_last_period
+                ):
+                    continue
+
+                filtered_periods.append(period)
+            periods = filtered_periods
+
+            if not periods:
+                return frame_pd.DataFrame()
 
         tasks = [
             self._read_period(
@@ -187,6 +230,40 @@ class AsyncScidReader:
 
         combined.index.name = "DateTime"
         return combined
+
+    def enumerate_front_month_contracts(
+        self,
+        ticker: str,
+        *,
+        start: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        end: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return metadata describing the generated front-month schedule."""
+
+        periods = self.generate_roll_schedule(
+            ticker,
+            start=start,
+            end=end,
+            roll_offset=roll_offset,
+            roll_convention=roll_convention,
+        )
+
+        results: List[Dict[str, Any]] = []
+        for period in periods:
+            results.append(
+                {
+                    "contract": period.contract.contract_id,
+                    "file": str(period.contract.file_path),
+                    "start": _ensure_utc(period.start),
+                    "end": _ensure_utc(period.end),
+                    "roll_date": _ensure_utc(period.roll_date),
+                    "expiry": _ensure_utc(period.expiry),
+                }
+            )
+
+        return results
 
     async def load_scid_files(
         self,
@@ -510,6 +587,7 @@ class ScidReader:
         resample_rule: Optional[str] = None,
         resample_kwargs: Optional[Dict[str, Any]] = None,
         drop_invalid_rows: bool = False,
+        preflight_peek: bool = False,
     ) -> "pd.DataFrame":
         """Load front-month series synchronously (handles asyncio internally)."""
         return asyncio.run(
@@ -526,6 +604,7 @@ class ScidReader:
                 resample_rule=resample_rule,
                 resample_kwargs=resample_kwargs,
                 drop_invalid_rows=drop_invalid_rows,
+                preflight_peek=preflight_peek,
             )
         )
 
