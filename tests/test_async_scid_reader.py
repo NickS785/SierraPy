@@ -7,7 +7,12 @@ import pandas as pd
 
 from sierrapy.parser import async_scid_reader as asc
 from sierrapy.parser.async_scid_reader import AsyncScidReader
-from sierrapy.parser.scid_parse import RollPeriod, ScidContractInfo
+from sierrapy.parser.scid_parse import (
+    RollConvention,
+    RollPeriod,
+    ScidContractInfo,
+    ScidTickerFileManager,
+)
 
 
 _created_readers: list["_DummyFastReader"] = []
@@ -41,15 +46,16 @@ class _DummyFastReader:
                 "2025-09-20T01:00:00Z",
                 "2025-10-19T23:00:00Z",
                 "2025-10-20T00:00:00Z",
+                "2025-11-10T00:00:00Z",
             ]
         )
 
         data = {
-            "Open": [1, 2, 3, 4, 5],
-            "High": [1, 2, 3, 4, 5],
-            "Low": [1, 2, 3, 4, 5],
-            "Close": [1, 2, 3, 4, 5],
-            "TotalVolume": [10, 20, 30, 40, 50],
+            "Open": [1, 2, 3, 4, 5, 6],
+            "High": [1, 2, 3, 4, 5, 6],
+            "Low": [1, 2, 3, 4, 5, 6],
+            "Close": [1, 2, 3, 4, 5, 6],
+            "TotalVolume": [10, 20, 30, 40, 50, 60],
         }
 
         frame = pd.DataFrame(data, index=idx)
@@ -135,6 +141,54 @@ def test_read_period_limits_contract_window(monkeypatch):
     assert set(df["Contract"].unique()) == {contract.contract_id}
 
 
+def test_read_period_includes_bars_past_roll_date(monkeypatch):
+    _created_readers.clear()
+
+    reader = AsyncScidReader("/tmp")
+
+    monkeypatch.setattr(asc, "FastScidReader", _DummyFastReader)
+
+    async def run_sync(func):
+        return func()
+
+    monkeypatch.setattr(reader, "_run_in_executor", run_sync)
+
+    contract = ScidContractInfo(
+        ticker="NG",
+        month="Z",
+        year=2025,
+        exchange="NYM",
+        file_path=Path("/fake/path-dec")
+    )
+
+    start = pd.Timestamp("2025-10-20T00:00:00Z")
+    end = pd.Timestamp("2025-11-20T00:00:00Z")
+
+    period = RollPeriod(
+        contract=contract,
+        start=start,
+        end=end,
+        roll_date=start,
+        expiry=end,
+    )
+
+    df = asyncio.run(
+        reader._read_period(
+            period,
+            columns=None,
+            include_metadata=True,
+            volume_per_bar=None,
+            volume_column="TotalVolume",
+            resample_rule=None,
+            resample_kwargs=None,
+            drop_volume_column=False,
+            drop_invalid_rows=False,
+        )
+    )
+
+    assert pd.Timestamp("2025-11-10T00:00:00+0000", tz="UTC") in df.index
+
+
 def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
     _parquet_exports.clear()
 
@@ -193,3 +247,55 @@ def test_export_scid_files_to_parquet(monkeypatch, tmp_path):
 
     assert stats[str(source_a)]["output"] == str(target_a)
     assert stats[str(source_b)]["output"] == str(target_b)
+
+
+def _build_contract(ticker: str, month: str, year: int, path: str) -> ScidContractInfo:
+    return ScidContractInfo(
+        ticker=ticker,
+        month=month,
+        year=year,
+        exchange="NYM",
+        file_path=Path(path),
+    )
+
+
+def test_generate_roll_schedule_next_roll(tmp_path):
+    manager = ScidTickerFileManager(tmp_path)
+    ticker = "NG"
+    nov = _build_contract(ticker, "X", 2025, "/fake/nov")
+    dec = _build_contract(ticker, "Z", 2025, "/fake/dec")
+
+    manager._ticker_contracts[ticker] = [nov, dec]
+
+    schedule = manager.generate_roll_schedule(
+        ticker,
+        roll_offset=pd.DateOffset(months=1),
+        roll_convention=RollConvention.NEXT_ROLL,
+    )
+
+    assert len(schedule) == 2
+    assert schedule[0].start == pd.Timestamp("2025-08-20 00:00:00")
+    assert schedule[0].end == pd.Timestamp("2025-10-20 00:00:00")
+    assert schedule[1].start == pd.Timestamp("2025-10-20 00:00:00")
+    assert schedule[1].end == pd.Timestamp("2025-11-20 00:00:00")
+
+
+def test_generate_roll_schedule_own_roll(tmp_path):
+    manager = ScidTickerFileManager(tmp_path)
+    ticker = "NG"
+    nov = _build_contract(ticker, "X", 2025, "/fake/nov")
+    dec = _build_contract(ticker, "Z", 2025, "/fake/dec")
+
+    manager._ticker_contracts[ticker] = [nov, dec]
+
+    schedule = manager.generate_roll_schedule(
+        ticker,
+        roll_offset=pd.DateOffset(months=1),
+        roll_convention=RollConvention.OWN_ROLL,
+    )
+
+    assert len(schedule) == 2
+    assert schedule[0].start == pd.Timestamp("2025-08-20 00:00:00")
+    assert schedule[0].end == pd.Timestamp("2025-09-20 00:00:00")
+    assert schedule[1].start == pd.Timestamp("2025-09-20 00:00:00")
+    assert schedule[1].end == pd.Timestamp("2025-10-20 00:00:00")

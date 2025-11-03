@@ -17,6 +17,7 @@ __email__ = "your.email@example.com"
 from .client.dtc_client import DTCClient, DTCClientConfig
 from .parser.scid_parse import (
     FastScidReader,
+    RollConvention,
     RollPeriod,
     ScidTickerFileManager,
     ScidContractInfo,
@@ -52,5 +53,6 @@ __all__ = [
     "ScidTickerFileManager",
     "ScidContractInfo",
     "RollPeriod",
+    "RollConvention",
     "Schema",
 ]

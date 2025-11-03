@@ -6,6 +6,7 @@ This module provides parsers for both SCID (intraday) and DLY (daily) file forma
 
 from .scid_parse import (
     FastScidReader,
+    RollConvention,
     RollPeriod,
     ScidTickerFileManager,
     ScidContractInfo,
@@ -41,6 +42,7 @@ __all__ = [
     "ScidTickerFileManager",
     "ScidContractInfo",
     "RollPeriod",
+    "RollConvention",
     "Schema",
 
     # DLY parsing
