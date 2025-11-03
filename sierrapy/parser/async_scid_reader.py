@@ -8,7 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
-from .scid_parse import FastScidReader, RollPeriod, ScidTickerFileManager
+from .scid_parse import (
+    FastScidReader,
+    RollConvention,
+    RollPeriod,
+    ScidTickerFileManager,
+)
 
 try:  # Optional dependency (aligned with FastScidReader)
     import pandas as pd
@@ -49,6 +54,22 @@ def _timestamp_to_epoch_ms(ts: Optional["pd.Timestamp"]) -> Optional[int]:
     return int(utc_ts.value // 1_000_000)
 
 
+def _normalize_roll_convention(
+    value: Union[RollConvention, str, None]
+) -> RollConvention:
+    if isinstance(value, RollConvention):
+        return value
+    if value is None:
+        return RollConvention.NEXT_ROLL
+    try:
+        return RollConvention(value.lower())
+    except ValueError as exc:
+        valid = ", ".join(member.value for member in RollConvention)
+        raise ValueError(
+            f"Unknown roll convention {value!r}. Expected one of: {valid}"
+        ) from exc
+
+
 class AsyncScidReader:
     """Asynchronously load front-month SCID data across contract rolls."""
 
@@ -78,6 +99,7 @@ class AsyncScidReader:
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
     ) -> List[RollPeriod]:
         start_ts = _coerce_timestamp(start)
         end_ts = _coerce_timestamp(end)
@@ -86,6 +108,7 @@ class AsyncScidReader:
             start=start_ts,
             end=end_ts,
             roll_offset=roll_offset,
+            roll_convention=_normalize_roll_convention(roll_convention),
         )
 
     async def load_front_month_series(
@@ -96,6 +119,7 @@ class AsyncScidReader:
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         columns: Optional[Sequence[str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
         include_metadata: bool = True,
         volume_per_bar: Optional[int] = None,
         volume_column: str = "TotalVolume",
@@ -124,6 +148,7 @@ class AsyncScidReader:
             start=start_ts,
             end=end_ts,
             roll_offset=roll_offset,
+            roll_convention=_normalize_roll_convention(roll_convention),
         )
 
         if not periods:
@@ -323,13 +348,6 @@ class AsyncScidReader:
                     drop_invalid_rows=drop_invalid_rows,
                 )
 
-            # STRICT enforcement: Delete any data at or past the roll date
-            # This prevents contract overlap during roll periods
-            if not df.empty:
-                roll_cutoff = _ensure_utc(period.roll_date)
-                # Keep only data before the roll date (exclusive)
-                df = df[df.index < roll_cutoff]
-
             # Apply period bounds
             if not df.empty:
                 mask = (df.index >= start_bound) & (df.index < end_bound)
@@ -467,12 +485,14 @@ class ScidReader:
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
     ) -> List[RollPeriod]:
         return self._async_reader.generate_roll_schedule(
             ticker,
             start=start,
             end=end,
             roll_offset=roll_offset,
+            roll_convention=roll_convention,
         )
 
     def load_front_month_series(
@@ -483,6 +503,7 @@ class ScidReader:
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         columns: Optional[Sequence[str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
         include_metadata: bool = True,
         volume_per_bar: Optional[int] = None,
         volume_column: str = "TotalVolume",
@@ -498,6 +519,7 @@ class ScidReader:
                 end=end,
                 columns=columns,
                 roll_offset=roll_offset,
+                roll_convention=roll_convention,
                 include_metadata=include_metadata,
                 volume_per_bar=volume_per_bar,
                 volume_column=volume_column,

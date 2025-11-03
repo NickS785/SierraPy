@@ -29,6 +29,7 @@ import mmap
 import os
 import struct
 from dataclasses import dataclass
+from enum import Enum
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
@@ -1203,6 +1204,13 @@ class FastScidReader:
 # ---------------------------- asynchronous helper -----------------------------
 
 
+class RollConvention(str, Enum):
+    """Available conventions for defining roll windows."""
+
+    NEXT_ROLL = "next_roll"
+    OWN_ROLL = "own_roll"
+
+
 @dataclass(frozen=True)
 class ScidContractInfo:
     """Contract information parsed from SCID filename."""
@@ -1330,6 +1338,7 @@ class ScidTickerFileManager:
         start: Optional[pd.Timestamp] = None,
         end: Optional[pd.Timestamp] = None,
         roll_offset: Optional[pd.DateOffset] = None,
+        roll_convention: RollConvention = RollConvention.NEXT_ROLL,
     ) -> List[RollPeriod]:
         """
         Build a roll schedule for ``ticker`` using "roll one month before expiry" logic.
@@ -1359,6 +1368,14 @@ class ScidTickerFileManager:
         if not contracts:
             return []
 
+        if isinstance(roll_convention, str):
+            try:
+                roll_convention = RollConvention(roll_convention.lower())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unknown roll convention: {roll_convention!r}"
+                ) from exc
+
         resolved_offset = roll_offset or pd.DateOffset(months=1)
 
         entries: List[Tuple[ScidContractInfo, pd.Timestamp, pd.Timestamp]] = []
@@ -1369,31 +1386,36 @@ class ScidTickerFileManager:
 
         entries.sort(key=lambda item: item[1])
 
-        if start is None:
-            start = entries[0][1] - resolved_offset
-        if end is None:
-            end = entries[-1][2]
+        schedule_start = start if start is not None else entries[0][1] - resolved_offset
+        schedule_end = end if end is not None else entries[-1][2]
 
         periods: List[RollPeriod] = []
+        cursor = schedule_start
+
         for idx, (contract, roll_date, expiry) in enumerate(entries):
-            previous_roll = entries[idx - 1][1] if idx > 0 else entries[0][1] - resolved_offset
-            window_start = max(start, previous_roll)
-            if window_start >= end:
+            if cursor >= schedule_end:
                 break
 
-            if window_start >= roll_date:
-                continue
+            if roll_convention is RollConvention.NEXT_ROLL:
+                if idx == 0:
+                    window_start = max(cursor, schedule_start)
+                else:
+                    window_start = max(cursor, roll_date)
 
-            if idx + 1 < len(entries):
-                next_roll_boundary = entries[idx + 1][1]
-            else:
-                next_roll_boundary = end
+                if idx + 1 < len(entries):
+                    next_boundary = entries[idx + 1][1]
+                else:
+                    next_boundary = schedule_end
 
-            window_end = min(end, next_roll_boundary)
-            if idx == len(entries) - 1:
-                window_end = min(window_end, expiry)
+                window_end = min(schedule_end, next_boundary)
+                if idx == len(entries) - 1:
+                    window_end = min(window_end, expiry)
+            else:  # RollConvention.OWN_ROLL
+                window_start = max(cursor, schedule_start)
+                window_end = min(schedule_end, roll_date)
 
             if window_start >= window_end:
+                cursor = max(cursor, window_end)
                 continue
 
             periods.append(
@@ -1405,6 +1427,8 @@ class ScidTickerFileManager:
                     expiry=expiry,
                 )
             )
+
+            cursor = window_end
 
         return periods
 
