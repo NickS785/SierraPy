@@ -96,71 +96,7 @@ def test_preflight_skips_non_overlapping(monkeypatch, tmp_path: Path, _schedule:
         return func()
 
     monkeypatch.setattr(reader, "_run_in_executor", run_sync)
-
-    contract_c = ScidContractInfo("NG", "G", 2026, "NYM", tmp_path / "c.scid")
-    period_c = RollPeriod(
-        contract=contract_c,
-        start=pd.Timestamp("2025-04-01T00:00:00Z"),
-        end=pd.Timestamp("2025-05-01T00:00:00Z"),
-        roll_date=pd.Timestamp("2025-04-15T00:00:00Z"),
-        expiry=pd.Timestamp("2025-05-01T00:00:00Z"),
-    )
-
-    _PEEK_RANGES[str(contract_c.file_path)] = (
-        8,
-        _epoch_ms("2025-03-15T00:00:00Z"),
-        _epoch_ms("2025-04-20T00:00:00Z"),
-    )
-
-    schedule = _schedule + [period_c]
-
-    monkeypatch.setattr(reader._manager, "generate_roll_schedule", lambda *_, **__: schedule)
-
-    baseline = asyncio.run(
-        reader.load_front_month_series(
-            "NG",
-            include_metadata=False,
-            preflight_peek=False,
-        )
-    )
-    baseline_calls = list(_TO_PANDAS_CALLS)
-
-    _TO_PANDAS_CALLS.clear()
-
-    optimized = asyncio.run(
-        reader.load_front_month_series(
-            "NG",
-            include_metadata=False,
-            preflight_peek=True,
-        )
-    )
-    optimized_calls = list(_TO_PANDAS_CALLS)
-
-    pd.testing.assert_frame_equal(baseline, optimized)
-
-    assert len(baseline_calls) == 3
-    assert len(optimized_calls) == 2
-    assert optimized_calls[0] == str(schedule[0].contract.file_path)
-    assert optimized_calls[1] == str(schedule[-1].contract.file_path)
-
-
-def test_preflight_keeps_truncated_final_period(monkeypatch, tmp_path: Path, _schedule: List[RollPeriod]) -> None:
-    reader = AsyncScidReader(tmp_path)
-
-    monkeypatch.setattr(asc, "FastScidReader", _PeekFastReader)
-
-    async def run_sync(func):
-        return func()
-
-    monkeypatch.setattr(reader, "_run_in_executor", run_sync)
     monkeypatch.setattr(reader._manager, "generate_roll_schedule", lambda *_, **__: _schedule)
-
-    final_path = str(_schedule[-1].contract.file_path)
-    _PEEK_RANGES[final_path] = (
-        2,
-        _epoch_ms("2025-02-01T00:00:00Z"),
-        _epoch_ms("2025-02-15T00:00:00Z"),
-    )
 
     baseline = asyncio.run(
         reader.load_front_month_series(
@@ -185,5 +121,5 @@ def test_preflight_keeps_truncated_final_period(monkeypatch, tmp_path: Path, _sc
     pd.testing.assert_frame_equal(baseline, optimized)
 
     assert len(baseline_calls) == 2
-    assert len(optimized_calls) == 2
-    assert optimized_calls[-1] == final_path
+    assert len(optimized_calls) == 1
+    assert optimized_calls[0] == str(_schedule[0].contract.file_path)

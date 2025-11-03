@@ -157,9 +157,7 @@ class AsyncScidReader:
 
         if preflight_peek:
             filtered_periods: List[RollPeriod] = []
-            total_periods = len(periods)
-            for idx, period in enumerate(periods):
-                is_last_period = idx == total_periods - 1
+            for period in periods:
                 try:
                     with FastScidReader(str(period.contract.file_path), read_only=True).open() as reader:
                         try:
@@ -184,11 +182,7 @@ class AsyncScidReader:
 
                 if period_end_ms_exclusive is not None and first_ms >= period_end_ms_exclusive:
                     continue
-                if (
-                    period_start_ms is not None
-                    and last_ms < period_start_ms
-                    and not is_last_period
-                ):
+                if period_start_ms is not None and last_ms < period_start_ms:
                     continue
 
                 filtered_periods.append(period)
