@@ -79,9 +79,13 @@ class AsyncScidReader:
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         max_concurrency: Optional[int] = None,
+        default_service: str = "sierra",
     ) -> None:
         self.reader = FastScidReader
-        self._manager = ScidTickerFileManager(str(directory))
+        self._directory = Path(directory)
+        self._manager_cache: Dict[str, ScidTickerFileManager] = {}
+        self._default_service = default_service.lower()
+        self._manager = self._get_manager(self._default_service)
         self._loop = loop
         self._semaphore: Optional[asyncio.Semaphore] = (
             asyncio.Semaphore(max_concurrency) if max_concurrency else None
@@ -92,10 +96,20 @@ class AsyncScidReader:
     def manager(self) -> ScidTickerFileManager:
         return self._manager
 
+    def _get_manager(self, service: str) -> ScidTickerFileManager:
+        key = service.lower()
+        try:
+            return self._manager_cache[key]
+        except KeyError:
+            manager = ScidTickerFileManager(str(self._directory), service=key)
+            self._manager_cache[key] = manager
+            return manager
+
     def generate_roll_schedule(
         self,
         ticker: str,
         *,
+        service: Optional[str] = None,
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
@@ -103,7 +117,8 @@ class AsyncScidReader:
     ) -> List[RollPeriod]:
         start_ts = _coerce_timestamp(start)
         end_ts = _coerce_timestamp(end)
-        return self._manager.generate_roll_schedule(
+        manager = self._get_manager(service or self._default_service)
+        return manager.generate_roll_schedule(
             ticker,
             start=start_ts,
             end=end_ts,
@@ -111,10 +126,11 @@ class AsyncScidReader:
             roll_convention=_normalize_roll_convention(roll_convention),
         )
 
-    async def load_front_month_series(
+    async def load_front_month_continuous(
         self,
         ticker: str,
         *,
+        service: str = "sierra",
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         columns: Optional[Sequence[str]] = None,
@@ -144,7 +160,9 @@ class AsyncScidReader:
                 effective_columns.append(volume_column)
                 drop_volume_column = True
 
-        periods = self._manager.generate_roll_schedule(
+        manager = self._get_manager(service)
+
+        periods = manager.generate_roll_schedule(
             ticker,
             start=start_ts,
             end=end_ts,
@@ -225,10 +243,48 @@ class AsyncScidReader:
         combined.index.name = "DateTime"
         return combined
 
+    async def load_front_month_series(
+        self,
+        ticker: str,
+        *,
+        service: str = "sierra",
+        start: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        end: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        columns: Optional[Sequence[str]] = None,
+        roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
+        include_metadata: bool = True,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+        drop_invalid_rows: bool = False,
+        preflight_peek: bool = False,
+    ) -> "pd.DataFrame":
+        """Backward compatible alias for :meth:`load_front_month_continuous`."""
+
+        return await self.load_front_month_continuous(
+            ticker,
+            service=service,
+            start=start,
+            end=end,
+            columns=columns,
+            roll_offset=roll_offset,
+            roll_convention=roll_convention,
+            include_metadata=include_metadata,
+            volume_per_bar=volume_per_bar,
+            volume_column=volume_column,
+            resample_rule=resample_rule,
+            resample_kwargs=resample_kwargs,
+            drop_invalid_rows=drop_invalid_rows,
+            preflight_peek=preflight_peek,
+        )
+
     def enumerate_front_month_contracts(
         self,
         ticker: str,
         *,
+        service: str = "sierra",
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
@@ -238,6 +294,7 @@ class AsyncScidReader:
 
         periods = self.generate_roll_schedule(
             ticker,
+            service=service,
             start=start,
             end=end,
             roll_offset=roll_offset,
@@ -538,10 +595,12 @@ class ScidReader:
         directory: Union[str, Path],
         *,
         max_concurrency: Optional[int] = None,
+        default_service: str = "sierra",
     ) -> None:
         self._async_reader = AsyncScidReader(
             directory,
             max_concurrency=max_concurrency,
+            default_service=default_service,
         )
 
 
@@ -553,6 +612,7 @@ class ScidReader:
         self,
         ticker: str,
         *,
+        service: Optional[str] = None,
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         roll_offset: Optional["pd.DateOffset"] = None,
@@ -560,16 +620,18 @@ class ScidReader:
     ) -> List[RollPeriod]:
         return self._async_reader.generate_roll_schedule(
             ticker,
+            service=service,
             start=start,
             end=end,
             roll_offset=roll_offset,
             roll_convention=roll_convention,
         )
 
-    def load_front_month_series(
+    def load_front_month_continuous(
         self,
         ticker: str,
         *,
+        service: str = "sierra",
         start: Optional[Union["pd.Timestamp", datetime, str]] = None,
         end: Optional[Union["pd.Timestamp", datetime, str]] = None,
         columns: Optional[Sequence[str]] = None,
@@ -585,8 +647,48 @@ class ScidReader:
     ) -> "pd.DataFrame":
         """Load front-month series synchronously (handles asyncio internally)."""
         return asyncio.run(
+            self._async_reader.load_front_month_continuous(
+                ticker,
+                service=service,
+                start=start,
+                end=end,
+                columns=columns,
+                roll_offset=roll_offset,
+                roll_convention=roll_convention,
+                include_metadata=include_metadata,
+                volume_per_bar=volume_per_bar,
+                volume_column=volume_column,
+                resample_rule=resample_rule,
+                resample_kwargs=resample_kwargs,
+                drop_invalid_rows=drop_invalid_rows,
+                preflight_peek=preflight_peek,
+            )
+        )
+
+    def load_front_month_series(
+        self,
+        ticker: str,
+        *,
+        service: str = "sierra",
+        start: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        end: Optional[Union["pd.Timestamp", datetime, str]] = None,
+        columns: Optional[Sequence[str]] = None,
+        roll_offset: Optional["pd.DateOffset"] = None,
+        roll_convention: Union[RollConvention, str, None] = None,
+        include_metadata: bool = True,
+        volume_per_bar: Optional[int] = None,
+        volume_column: str = "TotalVolume",
+        resample_rule: Optional[str] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None,
+        drop_invalid_rows: bool = False,
+        preflight_peek: bool = False,
+    ) -> "pd.DataFrame":
+        """Backward compatible alias for :meth:`load_front_month_continuous`."""
+
+        return asyncio.run(
             self._async_reader.load_front_month_series(
                 ticker,
+                service=service,
                 start=start,
                 end=end,
                 columns=columns,
