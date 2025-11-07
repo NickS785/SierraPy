@@ -1288,6 +1288,7 @@ class ScidContractInfo:
     year: int
     exchange: str
     file_path: Path
+    service: str = "sierra"
 
     @property
     def contract_id(self) -> str:
@@ -1311,12 +1312,16 @@ class RollPeriod:
 
 class ScidTickerFileManager:
     """
-    Manages SCID files for each ticker with format {ticker}{month_code}{2digit-year}-{exchange}.scid
-    Identifies the "front" month (closest large file to next calendar month) for current data.
+    Manages SCID files for each ticker using service-specific filename conventions.
+
+    The default "sierra" service expects filenames of the form
+    ``{ticker}{month_code}{two_digit_year}-{exchange}.scid``. The "rithmic"
+    service uses ``{ticker}{month_code}{one_digit_year}.{exchange}.scid``.
     """
 
-    def __init__(self, folder: str):
+    def __init__(self, folder: str, *, service: str = "sierra"):
         self.folder = Path(folder)
+        self.service = service.lower()
         self._ticker_files: Dict[str, List[Path]] = {}
         self._ticker_contracts: Dict[str, List[ScidContractInfo]] = {}
         self._discover_files()
@@ -1344,28 +1349,67 @@ class ScidTickerFileManager:
             self._ticker_files[ticker] = [c[1] for c in contracts_with_paths]
 
     def _parse_scid_filename(self, file_path: Path) -> Optional[ScidContractInfo]:
-        """Parse SCID filenames like CLH25-NYM.scid."""
+        """Parse SCID filenames according to the configured service."""
         import re
 
         MONTH_CODE_MAP = {
-            "F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
-            "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12
+            "F": 1,
+            "G": 2,
+            "H": 3,
+            "J": 4,
+            "K": 5,
+            "M": 6,
+            "N": 7,
+            "Q": 8,
+            "U": 9,
+            "V": 10,
+            "X": 11,
+            "Z": 12,
         }
 
-        m = re.match(r"([A-Za-z]+)([FGHJKMNQUVXZ])(\d{2})-([A-Za-z]+)\.scid", file_path.name, re.IGNORECASE)
-        if not m:
-            return None
+        service = self.service
+        name = file_path.name
 
-        ticker, mcode, yy, exch = m.groups()
-        yy = int(yy)
-        year = 2000 + yy if yy <= 70 else 1900 + yy  # Pivot year similar to dly_parse
+        if service == "sierra":
+            pattern = r"([A-Za-z]+)([FGHJKMNQUVXZ])(\d{2})-([A-Za-z]+)\.scid"
+            match = re.match(pattern, name, re.IGNORECASE)
+            if not match:
+                return None
+            ticker, mcode, yy, exch = match.groups()
+            yy_int = int(yy)
+            year = 2000 + yy_int if yy_int <= 70 else 1900 + yy_int
+        elif service == "rithmic":
+            pattern = r"([A-Za-z]+)([FGHJKMNQUVXZ])(\d)\.([A-Za-z]+)\.scid"
+            match = re.match(pattern, name, re.IGNORECASE)
+            if not match:
+                return None
+            ticker, mcode, yy, exch = match.groups()
+            yy_int = int(yy)
+            # Interpret one-digit year relative to the current decade.
+            from datetime import datetime, timezone
+
+            current_year = datetime.now(timezone.utc).year
+            decade_base = (current_year // 10) * 10
+            year = decade_base + yy_int
+            # Allow contracts from the previous decade when the digit would otherwise
+            # be more than ~5 years in the future.
+            if year > current_year + 5:
+                year -= 10
+            elif year < current_year - 5:
+                year += 10
+        else:
+            raise ValueError(f"Unsupported service '{service}'")
+
+        if mcode.upper() not in MONTH_CODE_MAP:
+            return None
 
         return ScidContractInfo(
             ticker=ticker.upper(),
             month=mcode.upper(),
             year=year,
             exchange=exch.upper(),
-            file_path=file_path
+            file_path=file_path,
+            service=service,
         )
 
     def _calculate_contract_expiry(self, contract: ScidContractInfo) -> pd.Timestamp:
