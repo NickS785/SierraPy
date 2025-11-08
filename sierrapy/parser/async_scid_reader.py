@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
 from .scid_parse import (
     FastScidReader,
@@ -68,6 +69,275 @@ def _normalize_roll_convention(
         raise ValueError(
             f"Unknown roll convention {value!r}. Expected one of: {valid}"
         ) from exc
+
+
+_MONTH_CODE: Dict[str, int] = {
+    "F": 1,
+    "G": 2,
+    "H": 3,
+    "J": 4,
+    "K": 5,
+    "M": 6,
+    "N": 7,
+    "Q": 8,
+    "U": 9,
+    "V": 10,
+    "X": 11,
+    "Z": 12,
+}
+
+
+_CONTRACT_PATTERN = re.compile(
+    r"(?P<root>[A-Za-z]+)(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{4}|\d{2})",
+    re.IGNORECASE,
+)
+
+
+def _parse_contract_from_sourcefile(path: str) -> Optional[str]:
+    if not path:
+        return None
+
+    name = Path(path).name
+    match = _CONTRACT_PATTERN.search(name)
+    if not match:
+        return None
+
+    root = match.group("root").upper()
+    month_code = match.group("month").upper()
+    year_token = match.group("year")
+
+    try:
+        year_value = int(year_token)
+    except (TypeError, ValueError):
+        return None
+
+    if len(year_token) == 2:
+        year_value = year_value + 2000 if year_value < 70 else year_value + 1900
+
+    return f"{root}{month_code}{year_value}"
+
+
+def _contract_sort_key(contract: str) -> Tuple[int, int]:
+    if not contract:
+        return (0, 0)
+
+    match = _CONTRACT_PATTERN.match(contract.strip())
+    if not match:
+        return (0, 0)
+
+    month_code = match.group("month").upper()
+    year_token = match.group("year")
+
+    try:
+        year_value = int(year_token)
+    except (TypeError, ValueError):
+        return (0, _MONTH_CODE.get(month_code, 0))
+
+    if len(year_token) == 2:
+        year_value = year_value + 2000 if year_value < 70 else year_value + 1900
+
+    return (year_value, _MONTH_CODE.get(month_code, 0))
+
+
+def _limit_to_active_window(
+    df: "pd.DataFrame",
+    start_ts: Optional["pd.Timestamp"],
+    end_ts: Optional["pd.Timestamp"],
+) -> "pd.DataFrame":
+    if df.empty:
+        result = df.copy()
+        result.index.name = "DateTime"
+        return result
+
+    result = df
+    if start_ts is not None:
+        result = result.loc[result.index >= _ensure_utc(start_ts)]
+    if end_ts is not None:
+        result = result.loc[result.index <= _ensure_utc(end_ts)]
+
+    result = result.copy()
+    result.index.name = "DateTime"
+    return result
+
+
+def _stitch_with_tail(
+    parts: Dict[str, "pd.DataFrame"],
+    schedule: List[Tuple[str, "pd.Timestamp", "pd.Timestamp"]],
+    *,
+    allow_tail: bool = True,
+) -> "pd.DataFrame":
+    frame_pd = _ensure_pandas()
+    logger = logging.getLogger(__name__)
+
+    if not schedule:
+        return frame_pd.DataFrame()
+
+    all_contracts = {contract for contract, _, _ in schedule} | set(parts.keys())
+    normalized_parts: Dict[str, "pd.DataFrame"] = {}
+
+    for contract in all_contracts:
+        df = parts.get(contract)
+        if df is None:
+            normalized = frame_pd.DataFrame()
+        else:
+            normalized = df.copy()
+
+        if not normalized.empty:
+            if not isinstance(normalized.index, frame_pd.DatetimeIndex):
+                if "DateTime" in normalized.columns:
+                    idx = frame_pd.to_datetime(
+                        normalized["DateTime"], errors="coerce", utc=True
+                    )
+                    normalized = normalized.copy()
+                    normalized.index = idx
+                else:
+                    idx = frame_pd.to_datetime(normalized.index, errors="coerce", utc=True)
+                    normalized.index = idx
+            else:
+                normalized.index = frame_pd.to_datetime(
+                    normalized.index, errors="coerce", utc=True
+                )
+
+            normalized = normalized.loc[~normalized.index.isna()]
+            normalized.sort_index(inplace=True)
+        else:
+            normalized = normalized.copy()
+
+        normalized.index.name = "DateTime"
+
+        contract_value: Optional[str] = None
+        if "contract" in normalized.columns:
+            candidates = normalized["contract"].dropna().astype(str)
+            if not candidates.empty:
+                contract_value = candidates.iloc[0]
+        if contract_value is None and "Contract" in normalized.columns:
+            candidates = normalized["Contract"].dropna().astype(str)
+            if not candidates.empty:
+                contract_value = candidates.iloc[0]
+        if contract_value is None and "SourceFile" in normalized.columns:
+            for path in normalized["SourceFile"].dropna().astype(str):
+                parsed = _parse_contract_from_sourcefile(path)
+                if parsed:
+                    contract_value = parsed
+                    break
+        if contract_value is None:
+            contract_value = contract
+
+        if "SourceFile" not in normalized.columns:
+            normalized["SourceFile"] = ""
+        else:
+            normalized["SourceFile"] = normalized["SourceFile"].fillna("")
+
+        normalized["contract"] = contract_value
+
+        normalized_parts[contract] = normalized
+
+    tail_priority = sorted(normalized_parts.keys(), key=_contract_sort_key, reverse=True)
+    priority_map = {name: idx + 1 for idx, name in enumerate(tail_priority)}
+
+    stitched_segments: List["pd.DataFrame"] = []
+
+    for contract, start_ts, end_ts in schedule:
+        start_bound = _ensure_utc(start_ts)
+        end_bound = _ensure_utc(end_ts)
+
+        base_df = normalized_parts.get(contract, frame_pd.DataFrame())
+        window_frames: List["pd.DataFrame"] = []
+        base_last: Optional["pd.Timestamp"] = None
+
+        if not base_df.empty:
+            base_slice = _limit_to_active_window(base_df, start_bound, end_bound)
+            if not base_slice.empty:
+                base_last = base_slice.index.max()
+                if base_last is not None and base_last > end_bound:
+                    base_last = end_bound
+                base_slice = _limit_to_active_window(base_slice, start_bound, base_last)
+                base_slice = base_slice.copy()
+                base_slice["_stitch_priority"] = 0
+                if base_last is not None and "ContractExpiry" in base_slice.columns:
+                    base_slice["ContractExpiry"] = _ensure_utc(base_last)
+                window_frames.append(base_slice)
+
+        cursor = (
+            base_last
+            if base_last is not None
+            else start_bound - frame_pd.Timedelta(nanoseconds=1)
+        )
+
+        if allow_tail and (base_last is None or base_last < end_bound):
+            for tail_contract in tail_priority:
+                if tail_contract == contract:
+                    continue
+
+                tail_df = normalized_parts.get(tail_contract)
+                if tail_df is None or tail_df.empty:
+                    continue
+
+                tail_slice = _limit_to_active_window(tail_df, start_bound, end_bound)
+                if cursor is not None:
+                    tail_slice = tail_slice.loc[tail_slice.index > cursor]
+
+                if tail_slice.empty:
+                    continue
+
+                tail_slice = tail_slice.copy()
+                tail_slice["_stitch_priority"] = priority_map.get(tail_contract, len(priority_map) + 1)
+
+                tail_end = tail_slice.index.max()
+                if tail_end is not None and "ContractExpiry" in tail_slice.columns:
+                    effective_tail_end = tail_end if tail_end <= end_bound else end_bound
+                    tail_slice["ContractExpiry"] = _ensure_utc(effective_tail_end)
+
+                logger.debug(
+                    "Tail stitching %s into %s window [%s, %s]",
+                    tail_contract,
+                    contract,
+                    start_bound,
+                    tail_slice.index.max(),
+                )
+                window_frames.append(tail_slice)
+                cursor = tail_slice.index.max()
+                if cursor is not None and cursor >= end_bound:
+                    break
+
+        if not window_frames:
+            continue
+
+        window_df = frame_pd.concat(window_frames, axis=0, sort=False)
+        if window_df.empty:
+            continue
+
+        window_df = window_df.copy()
+        window_df["_DateTime"] = window_df.index
+        window_df.sort_values(
+            by=["_DateTime", "_stitch_priority", "contract"],
+            inplace=True,
+            kind="stable",
+        )
+        window_df = window_df.loc[~window_df["_DateTime"].duplicated(keep="first")]
+        window_df = window_df.drop(columns=["_stitch_priority"], errors="ignore")
+        window_df = window_df.set_index("_DateTime")
+        window_df.index.name = "DateTime"
+        stitched_segments.append(window_df)
+
+    if not stitched_segments:
+        return frame_pd.DataFrame()
+
+    combined = frame_pd.concat(stitched_segments, axis=0, sort=False)
+    if combined.empty:
+        combined.index.name = "DateTime"
+        return combined
+
+    combined.sort_index(inplace=True)
+    combined = combined.loc[~combined.index.duplicated(keep="first")]
+    combined.index.name = "DateTime"
+
+    if "contract" in combined.columns:
+        combined["contract"] = combined["contract"].astype(str)
+    if "Contract" in combined.columns:
+        combined["Contract"] = combined["Contract"].astype(str)
+
+    return combined
 
 
 class AsyncScidReader:
@@ -143,8 +413,37 @@ class AsyncScidReader:
         resample_kwargs: Optional[Dict[str, Any]] = None,
         drop_invalid_rows: bool = False,
         preflight_peek: bool = False,
+        allow_tail: bool = True,
 
     ) -> "pd.DataFrame":
+        """Load a continuous front-month series with optional tail stitching.
+
+        Parameters
+        ----------
+        ticker:
+            The futures ticker symbol to load.
+        service:
+            Service name that determines filename conventions.
+        start, end:
+            Optional UTC boundaries to constrain the schedule and output.
+        columns:
+            Columns to request from :class:`FastScidReader`.
+        roll_offset, roll_convention:
+            Arguments forwarded to :meth:`ScidTickerFileManager.generate_roll_schedule`.
+        include_metadata:
+            When ``True`` (default) attach contract metadata columns.
+        volume_per_bar, volume_column, resample_rule, resample_kwargs:
+            Additional parameters forwarded to :meth:`FastScidReader.to_pandas`.
+        drop_invalid_rows:
+            Drop rows flagged as invalid by the reader when ``True``.
+        preflight_peek:
+            Skip contracts with no data when ``True`` by peeking at file ranges.
+        allow_tail:
+            When ``True`` (default), fill gaps at the end of a contract's scheduled
+            window using the latest subsequent contract with available data. Tail
+            stitching also caps the effective expiry of each contract at its final
+            observed bar.
+        """
         frame_pd = _ensure_pandas()
 
         start_ts = _coerce_timestamp(start)
@@ -229,11 +528,46 @@ class AsyncScidReader:
         if not frames:
             return frame_pd.DataFrame()
 
-        combined = frame_pd.concat(frames, axis=0)
-        combined.sort_index(inplace=True)
+        inclusive_offset = frame_pd.Timedelta(nanoseconds=1)
+        schedule: List[Tuple[str, "pd.Timestamp", "pd.Timestamp"]] = []
+        contract_frames: Dict[str, "pd.DataFrame"] = {}
 
-        # Remove any duplicate timestamps (shouldn't occur with strict roll cutoff, but safety check)
-        combined = combined.loc[~combined.index.duplicated(keep="last")]
+        for period, df in zip(periods, frames):
+            contract_label = (
+                f"{period.contract.ticker.upper()}"
+                f"{period.contract.month.upper()}"
+                f"{period.contract.year}"
+            )
+            window_start = _ensure_utc(period.start)
+            window_end_exclusive = _ensure_utc(period.end)
+
+            if frame_pd.isna(window_end_exclusive) or window_end_exclusive <= window_start:
+                window_end = window_start
+            else:
+                window_end = window_end_exclusive - inclusive_offset
+                if window_end < window_start:
+                    window_end = window_start
+
+            schedule.append((contract_label, window_start, window_end))
+
+            current_df = df if df is not None else frame_pd.DataFrame()
+            if "SourceFile" not in current_df.columns:
+                current_df = current_df.copy()
+                current_df["SourceFile"] = str(period.contract.file_path) if not current_df.empty else ""
+
+            current_df = current_df.copy()
+            current_df["contract"] = contract_label
+
+            existing = contract_frames.get(contract_label)
+            if existing is not None and not existing.empty:
+                current_df = frame_pd.concat([existing, current_df], axis=0, sort=False)
+
+            contract_frames[contract_label] = current_df
+
+        combined = _stitch_with_tail(contract_frames, schedule, allow_tail=allow_tail)
+
+        if combined.empty:
+            return combined
 
         if start_ts is not None:
             combined = combined.loc[combined.index >= _ensure_utc(start_ts)]
@@ -260,6 +594,7 @@ class AsyncScidReader:
         resample_kwargs: Optional[Dict[str, Any]] = None,
         drop_invalid_rows: bool = False,
         preflight_peek: bool = False,
+        allow_tail: bool = True,
     ) -> "pd.DataFrame":
         """Backward compatible alias for :meth:`load_front_month_continuous`."""
 
@@ -278,6 +613,7 @@ class AsyncScidReader:
             resample_kwargs=resample_kwargs,
             drop_invalid_rows=drop_invalid_rows,
             preflight_peek=preflight_peek,
+            allow_tail=allow_tail,
         )
 
     def enumerate_front_month_contracts(

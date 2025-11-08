@@ -150,6 +150,16 @@ continuous_df, raw_files = asyncio.run(load_continuous_series())
 print(continuous_df.head())
 ```
 
+#### Tail stitching and effective expiry
+
+`AsyncScidReader.load_front_month_continuous` now performs **tail stitching** by
+default. When the scheduled contract runs out of bars before its roll window
+ends, the reader fills the gap with the next available contract (for example,
+using `GCZ` head bars after `GCV` runs dry). The helper also caps each
+contract's effective expiry at the timestamp of its final bar so metadata never
+indicates an expiry later than the observed data. The behaviour can be disabled
+by passing `allow_tail=False`.
+
 ## File Format Support
 
 ### SCID Files
